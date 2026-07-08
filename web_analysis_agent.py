@@ -15,7 +15,7 @@ logger.addHandler(console_handler)
 # logger.addHandler(file_handler)
 
 import re
-import os, uuid
+import os, uuid, gzip
 from datetime import datetime
 import asyncio
 
@@ -23,6 +23,8 @@ from typing import TypedDict, Optional, List, Set, Dict, Any, Annotated
 from dataclasses import dataclass, field, replace
 
 from langchain_openai import ChatOpenAI
+VLLM_MAX_MODEL_LEN=113584
+#VLLM_MAX_MODEL_LEN=131072
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, RemoveMessage
 from langgraph.graph import StateGraph, START, END
 
@@ -33,7 +35,7 @@ MAX_DEEP = 3  # Maximal diving deepness
 
 # Now launch llm and start exploring
 llm_base = ChatOpenAI(
-    #b ase_url="http://ifo4:8000/v1",
+    # base_url="http://ifo4:8000/v1",
     # api_key="alex_llm_qwen",
     # model_name="QuantTrio/Qwen3.6-27B-AWQ",
     # temperature=0.1,
@@ -59,7 +61,7 @@ class AgenticStateDataclass :  # The state structure
     browser_state : List[str] = field(default_factory=list)  # Browser state
     web_links     : List[str] = field(default_factory=list)  # Stack of unique links on the current page
     # ----------  UTILITY  ---------- #
-    browser       : Optional['BrowserProxy'] = field(init=True, default=None) # The proxy browser
+    browser       : Optional['MCPBrowserRunner'] = field(init=True, default=None) # The proxy browser
     db            : Optional['LMDB']         = field(init=True, default=None) # The LMDB
     # ---------- STATISTICS AT THIS LAYER ---------- #
     visited       : int = 0  # Amount of visited urls in this stream
@@ -128,40 +130,57 @@ async def DIG_routine(agentic_state : AgenticState) -> Optional[Dict[str, Agenti
     state.web_links.append(None)
     state.context.append(None)
     state.deep += 1
-    browser_location = await browser.navigate(url_string)
-    if browser_location is not None :
-        logger.debug(f"browser_locations is not None")
-        state.context[-1] = f"Arrived at url {url_string}.\n"
-        state.visited += 1
-        browser_content = await browser.get_content()
-        if browser_content is not None :
-            state.browser_state[-1] = clean_dom(browser_content)
-            if state.deep <= MAX_DEEP and is_same_registered_domain(state.url[0], url_string) :
-                # --- Extract all webpage links ---
-                web_links = await browser.get_links()
-                if web_links is not None :
-                    state.web_links[-1] = state.db.check_keys(web_links) # Filter visited links
-                    state.context[-1] += f"Extracted {len(state.web_links[-1] )} uniquie web liks.\n"
-                    logger.info(f"extracted {len(state.web_links[-1])} links from page {state.url[-1]}.")
-                else                     :
-                    state.context[-1] += f"Failed to extract web links at {len(state.web_links[-1] )}.\n"
-    return None # This agent update its state himself - no branching is there
-
+    for n_retries in range(2) : # Default number of retries
+        browser_location = await browser.managed_browser.navigate(url_string)
+        if browser_location is None :
+            logger.error(f"Browsed dies when navigating to {url_string}")
+            await browser.close_managed_browser()
+            await browser.get_managed_browser()
+        else                        :
+            logger.debug(f"browser_locations is not None")
+            state.context[-1] = f"Arrived at url {url_string}.\n"
+            state.visited += 1
+            browser_content = await browser.managed_browser.get_content()
+            if browser_content is None :
+                logger.error(f"Browsed dies when getting content of {url_string}")
+                await browser.close_managed_browser()
+                await browser.get_managed_browser()
+            else                       :
+                state.browser_state[-1] = clean_dom(browser_content)
+                if state.deep <= MAX_DEEP and is_same_registered_domain(state.url[0], url_string) :
+                    # --- Extract all webpage links ---
+                    web_links = await browser.managed_browser.get_links()
+                    if web_links is None :
+                        logger.error(f"Browsed dies when extracting links from {url_string}")
+                        await browser.close_managed_browser()
+                        await browser.get_managed_browser()
+                    else                 :
+                        state.web_links[-1] = state.db.check_keys(web_links) # Filter visited links
+                        state.context[-1] += f"Extracted {len(state.web_links[-1] )} uniquie web liks.\n"
+                        logger.info(f"extracted {len(state.web_links[-1])} links from page {state.url[-1]}.")
+        assert browser.managed_browser.browser_instance_id is not None , "Failed to restart browser after a failure!"
+        return None
 
 # This routine saves data to hdd in format ./data/YYYY-MM-DD/unique_uuid.md
 DATA_PREFIX="./data/"
-def save_story(story : str) -> str :
+HTML_PREFIX="./html/"
+def save_story(story : str, raw_html : Optional[str]=None) -> str :
     date_str = datetime.now().strftime("%Y-%m-%d")
     save_dir = os.path.join(f"{DATA_PREFIX}", date_str)
     os.makedirs(save_dir, exist_ok=True)
     while True :
-        unique_fname = f"{uuid.uuid4()}.md"
-        file_path = os.path.join(save_dir, unique_fname)
+        unique_fname = f"{uuid.uuid4()}"
+        file_path = os.path.join(save_dir, unique_fname + ".md")
         if not os.path.exists(file_path):
             break
     logger.debug(f"saving STORY into {file_path}")
     with open(file_path, "w", encoding="utf-8") as f :
         f.write(story)
+    if raw_html is not None :
+        save_dir = os.path.join(f"{HTML_PREFIX}", date_str)
+        os.makedirs(save_dir, exist_ok=True)
+        with gzip.open(os.path.join(save_dir, unique_fname + ".gz"), "wt", encoding="utf-8", compresslevel=9) as f :
+            f.write(raw_html)
     return file_path
 
 # This agent iteratively rewrites story for saving
@@ -235,7 +254,7 @@ async def ANL_llmgent(agentic_state : AgenticState) -> Optional[Dict[str, Agenti
     context_text = ""
     context_text += "\n".join(f"{i}. {s}" for i, s in enumerate(state.context, start=0))
     # 2. The Analyser Prompt
-    access_agent_prompt = (
+    classifier_agent_prompt = (
         f"# ROLE & CONTEXT\n"
         f"You are the web scrapper handling tree-search exploration of STOCKS-related content.\n"
         f"You are looking for news pages to assist following agent in making trading decisions, but the route typically goes via aggregator pages.\n"
@@ -259,25 +278,30 @@ async def ANL_llmgent(agentic_state : AgenticState) -> Optional[Dict[str, Agenti
         f"# DATA \n"
         f"## CURRENT BROWSER STATE\n"
         f"```html\n"
-        f"{state.browser_state}\n"
+        f"{state.browser_state[-1]}\n"
         f"```\n\n"
     )
     # Do several classification attempts
     classification_attempts = 0
     classification_logs     = []
-    response = await llm_base.ainvoke([SystemMessage(content=access_agent_prompt),
-                                       HumanMessage(content=f"Please execute the requested task. Use your thinking process to analyze the page.\n")],
-                                      config={"configurable": {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}}})
+    num_tokens = llm_base.get_num_tokens(classifier_agent_prompt)     # Get the count
+    if num_tokens > 0.9 * VLLM_MAX_MODEL_LEN :
+        classifier_agent_prompt = classifier_agent_prompt[: int((0.9 * VLLM_MAX_MODEL_LEN) / num_tokens * len(classifier_agent_prompt))] + "```\n\n WARNING. The browser state was truncated due to its out-of-window size!\n\n"
+    response = await llm_base.ainvoke([ SystemMessage(content=classifier_agent_prompt),
+                                        HumanMessage(content=f"Please execute the requested task. Use your thinking process to analyze the page.\n\n") ],
+                                        config={"configurable": {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}}})
     raw_content = response.content
     clean_response = re.sub(r'.*?</think>', '', raw_content, flags=re.DOTALL).strip()
     while (match := re.search(r'\b(STORY|AGGREGATOR|IRRELEVANT)\b', clean_response, re.IGNORECASE) ) is None and classification_attempts < 3 :
         # Invoke the model
         classification_attempts += 1
         classification_logs.append(f" - ATTEMPT: {classification_attempts} RESPONSE: {clean_response}\n")
-        response = await llm_base.ainvoke([SystemMessage(content=access_agent_prompt),
-                                           HumanMessage(
-                                               content=(f"Please execute the requested task. Use your thinking process to analyze the page.\n"
-                                                        f"Please better follow the requested output format! {classification_attempts} previous attempts had filed: {"\n".join(classification_logs)}")) ],
+        classifier_agent_update = "\n".join(classification_logs)
+        if len(classifier_agent_update) > 3 * 0.1 * VLLM_MAX_MODEL_LEN : # Rought estimate of tokens count: 3 char per token
+            classifier_agent_update = classifier_agent_update[-int(3 * 0.1 * VLLM_MAX_MODEL_LEN) :] + "```\n\n WARNING. The error log was truncated due to its out-of-window size!\n\n"
+        response = await llm_base.ainvoke([ SystemMessage(content=classifier_agent_prompt),
+                                            HumanMessage(content=(f"Please execute the requested task. Use your thinking process to analyze the page.\n"
+                                                                  f"Please better follow the requested output format! {classification_attempts} previous attempts had filed:\n ```\n {classifier_agent_update} ```\n\n")) ],
                                           config={"configurable": {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}}})
         raw_content = response.content
         clean_response = re.sub(r'.*?</think>', '', raw_content, flags=re.DOTALL).strip()
@@ -289,7 +313,7 @@ async def ANL_llmgent(agentic_state : AgenticState) -> Optional[Dict[str, Agenti
             story   = await story_rewritting_agent(state.deep, state.url[0], state.url[-1], context_text, state.browser_state[-1])
             if story is not None :
                 state.context[-1] += f"The paage (url={state.url[-1]}) is a \"STORY\". I am  extracting it and keep traversing the links.\n"
-                file_name = save_story(story)
+                file_name = save_story(story,  f"<!-- Source: {state.url[-1]} -->\n" + state.browser_state[-1])
                 state.saved += 1
                 state.db.put(state.url[-1], file_name[7:]) # Ommit ./data/ prefix
             else                 :
@@ -338,8 +362,8 @@ async def RET_routine(agentic_state : AgenticState) -> Optional[Dict[str, Agenti
 
 
 # Your isolated agent workflow. It only cares about using an active session/browser.
-async def run_web_analysis_agent(browser : BrowserProxy, url_string: str, db : LMDB) -> None :
-    print(f"Agent starting analysis on: url={url_string} using browser instance context: {browser.browser_instance_id}\n")
+async def run_web_analysis_agent(browser : MCPBrowserRunner, url_string: str, db : LMDB) -> None :
+    print(f"Agent starting analysis on: url={url_string} using browser instance context: {browser.managed_browser.browser_instance_id}\n")
 
     # --- Graph Assembly ---
 
@@ -356,7 +380,7 @@ async def run_web_analysis_agent(browser : BrowserProxy, url_string: str, db : L
     builder.add_node("RET", RET_routine)
     # Define edges
     builder.add_edge(START, "DIG")
-    builder.add_conditional_edges("DIG", lambda state : str(state["agentic_state"].browser_state is None),{"False": "ANL", "True": "RET"})
+    builder.add_conditional_edges("DIG", lambda state : str(state["agentic_state"].browser_state[-1] is None),{"False": "ANL", "True": "RET"})
     builder.add_edge("ANL", "RET")
     builder.add_conditional_edges("RET", lambda state : str(state["agentic_state"].deep == 0),            {"False": "DIG", "True":  END })
     # Finalize
@@ -399,7 +423,7 @@ async def main() -> None:
     # Wrap a database
     with LMDB(db_path="./data/stocks.db") as db :
         # Launch browser
-        runner : MCPBrowserRunner = MCPBrowserRunner()
+        runner : MCPBrowserRunner = MCPBrowserRunner(logger)
         # Launch agent
         await runner.run(run_web_analysis_agent, url_string="https://ca.finance.yahoo.com/", db=db)
 
