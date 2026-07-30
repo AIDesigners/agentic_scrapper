@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vllm": {
+      "name": "Local vLLM",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://ifo4:8000/v1",
+        "apiKey": "alex_llm_qwen"
+      },
+      "models": {
+        "poolside/Laguna-XS-2.1-NVFP4": {
+          "name": "Laguna-XS-2.1-NVFP4",
+          "limit": {
+            "context": 131072,
+            "output": 131072
+          }
+        }
+      }
+    }
+  },
+  "model": "vllm/poolside/Laguna-XS-2.1-NVFP4",
+  "compaction": {
+    "auto": true,
+    "keep": {
+      "tokens": 32768
+    },
+    "buffer": 16384
+  }
+}

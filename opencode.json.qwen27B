@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vllm": {
+      "name": "Local vLLM",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://ifo4:8000/v1",
+        "apiKey": "alex_llm_qwen"
+      },
+      "models": {
+        "QuantTrio/Qwen3.6-27B-AWQ": {
+          "name": "Qwen-3.6-27B-AWQ",
+          "limit": {
+            "context": 131072,
+            "output": 131072
+          }
+        }
+      }
+    }
+  },
+  "model": "vllm/QuantTrio/Qwen3.6-27B-AWQ",
+  "compaction": {
+    "auto": true,
+    "keep": {
+      "tokens": 32768
+    },
+    "buffer": 16384
+  }
+}
