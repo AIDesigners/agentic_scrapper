@@ -171,6 +171,35 @@ class RedisDBClient:
         """
         await self.disconnect()
 
+    async def check_only(self, url: str) -> int:
+        """
+        Check if a URL has been visited WITHOUT adding it to the set.
+
+        Pure read operation. Use it to decide whether to omit a page.
+        The visited set is only ever updated via check_and_add().
+
+        Returns:
+            1 if URL is already visited
+            0 if URL is not visited yet
+            -1 on error
+        """
+        if self._client is None:
+            logger.error("Redis client is not yet opened!")
+            return -1
+
+        if self.readonly:
+            if url in self._visited_urls:
+                logger.debug(f"URL already visited (internal storage): {url}")
+                return 1
+        try:
+            exists = await self._client.sismember(self.CRAWLER_VISITED_URLS, url)
+        except Exception as e:
+            logger.error(f"Redis error: {e}")
+            return -1
+        if exists:
+            logger.debug(f"URL already visited (Redis): {url}")
+        return 1 if exists else 0
+
     async def check_and_add(self, url: str) -> int:
         """
         Check if a URL has been visited and add it if not already present.

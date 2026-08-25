@@ -23,7 +23,7 @@ for _p in (_SRC, _CRW):
         sys.path.insert(0, _p)
 
 import pytest
-from run_agent import run_stealth_graph, logger
+from crawler_agent import run_stealth_graph, logger
 
 # constants
 _HTML_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'html'))
