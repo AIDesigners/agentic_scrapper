@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "vllm": {
+      "name": "Local vLLM",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://ifo4:8000/v1",
+        "apiKey": "alex_llm_qwen"
+      },
+      "models": {
+        "unsloth/Qwen3.8-27B-NVFP4": {
+          "name": "Qwen-3.8-27B-NVFP4",
+          "limit": {
+            "context": 163840,
+            "output": 163840
+          }
+        }
+      }
+    }
+  },
+  "model": "vllm/unsloth/Qwen3.8-27B-NVFP4",
+  "compaction": {
+    "auto": true,
+    "keep": {
+      "tokens": 32768
+    },
+    "buffer": 16384
+  }
+}

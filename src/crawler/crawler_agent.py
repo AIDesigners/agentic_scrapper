@@ -29,7 +29,8 @@ import httpx
 
 # Make the parent 'src' directory importable so that modules moved there
 # (rabbit_driver, redis_driver) can be imported as top-level modules.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _SRC_ROOT)
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, RemoveMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -40,6 +41,10 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 
 from web_tools import clean_dom
+
+# Optional site-specific apriori traversal filters (boosters), selected by the
+# entry URL. See crawler_site_filters.py (same dir) for the registry + boosters.
+from crawler_site_filters import SiteFilter, select_site_filter
 
 BASE_URL="http://ifo4:8000"
 BASE_API_KEY="alex_llm_qwen"
@@ -116,7 +121,7 @@ class BrowserProxy :
                 self.logger.warning(f"JS/Page error on attempt {attempt + 1} of {max_retries}.")
                 if attempt < max_retries - 1:
                     self.logger.warning("Triggering native page reload...")
-                    mcp_response = await self("reload_page", {"wait_until": "networkidle"})
+                    mcp_response = await self("reload_page")
                     if not mcp_response : return None
                 continue
             # --- 2. IF SUCCESSFUL ---
@@ -291,8 +296,7 @@ class StealthMCPManager:
         """Internal helper to close the browser instance safely."""
         if self._mcp_session and self._managed_browser:
             try:
-                # Assuming managed_browser holds the ID or can be stringified as expected by the tool
-                await self._mcp_session.call_tool("close_browser", {"instance_id": self.managed_browser})
+                await asyncio.wait_for(self.mcp_session.call_tool("close_instance", {"instance_id" : self.managed_browser.browser_instance_id }), timeout=15.0)
             except Exception as e:
                 if self.logger:
                     self.logger.error(f"Error while closing managed browser: {e}")
@@ -482,7 +486,6 @@ class AgenticState(TypedDict):
             represents a level in the exploration tree. URLs are popped as visited.
         url_current (str): Current active url after it is popped from urls nested list
         deepness_max (int): Maximum depth allowed for tree exploration.
-        pages_number (int): Number of visited pages at current depth.
         pages_saved (int): Number of saved stories at current depth.
         pages_max (int): Maximum pages to visit (-1 means unlimited).
         retries_max (int): Maximum retry attempts for failed page access.
@@ -493,12 +496,16 @@ class AgenticState(TypedDict):
         mcp_manager (StealthMCPManager): Handler for MCP/MCP tools integration.
         rabbit_manager (RabbitMQClient): Handler for message queue operations.
         redis_manager (RedisDBClient): Handler for visited URL tracking.
+        site_filter (SiteFilter): Site-specific apriori traversal filter
+            (booster) selected from the entry URL; the no-op default for
+            unregistered sites. Rejects non-story branches before the browser
+            enters them. The zero-level (entry) URL itself is exempt from the
+            filter: only URLs popped from the recursion lists are checked.
     """
     date_str         : str
     urls             : List[List[str]]
     url_current      : List[str]
     deepness_max     : int 
-    pages_number     : List[int] 
     pages_saved      : List[int] 
     retries_max      : int 
     retry_counter    : List[int]
@@ -508,6 +515,7 @@ class AgenticState(TypedDict):
     mcp_manager      : StealthMCPManager  
     rabbit_manager   : RabbitMQClient     
     redis_manager    : RedisDBClient
+    site_filter      : SiteFilter
 
 
 # The agentic system
@@ -545,6 +553,14 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
         AssertionError: If state becomes desynchronized or browser management fails.
     """
 
+    # Select the site-specific booster (apriori filter) based on the name of
+    # the entry URL. Registered sites get a concrete filter that rejects
+    # non-story branches (e.g. Yahoo Finance /quote/<TICKER> aggregators)
+    # BEFORE the browser enters them, which speeds up the traversal.
+    # Unregistered sites get the no-op default filter.
+    site_filter = select_site_filter(url_string)
+    logger.info(f"SITE FILTER SELECTED. Entry URL={url_string} -> {type(site_filter).__name__}")
+
     # ----------------------------   A G E N T S   ----------------------------
 
     # This agent attempt to access web page content using tools
@@ -576,9 +592,12 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                - Save content to browser_state
                - Clear page_history to signal completion
                - Return to proceed to content classifier agent
-            4. If content extraction fails and max retries reached:
-               - Log the failure and continue to next URL
-            5. Retry counter prevents infinite loops on stuck pages
+            4. If the prompt exceeds the LLM context budget (oversized page):
+                - Log a warning, discard the page (clear browser_state/history/retries)
+                  and continue to the next URL
+            5. If content extraction fails and max retries reached:
+                - Log the failure and continue to next URL
+            6. Retry counter prevents infinite loops on stuck pages
         Returns:
             None (modifies state in-place)
         """
@@ -593,11 +612,23 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                     return None    
                 else              :
                     url = state["urls"][-1].pop()
-                # Check if URL is already visited via RedisDB
-                if await state["redis_manager"].check_and_add(url) != 0 :  # Already existed if 0
-                    state["url_current"][0] = url
-                    await state["mcp_manager"].managed_browser.navigate(state["url_current"][0])
-                    break
+                # Omit already visited pages. READ-ONLY check (check): the visited DB
+                # is NOT updated here - it is updated only after classification
+                # in page_classify_agent. Returns 1 if already visited.
+                if await state["redis_manager"].check_only(url) != 1 :
+                    # Apriori site-specific pruning: reject known non-story branches
+                    # (e.g. Yahoo Finance /quote/<TICKER> aggregators) BEFORE entering.
+                    # Only URLs popped from the recursion lists (level > 0) are
+                    # filtered; the zero-level (entry) URL is always visited as-is.
+                    if len(state["urls"]) != 1 and not state["site_filter"].is_story_candidate(url) :
+                        logger.info(f"SKIPPED URL (apriori site filter). url={url}")
+                    else                                                :
+                        state["url_current"][0] = url
+                        logger.info(f"NEW URL. Navigating to: {url}")
+                        await state["mcp_manager"].managed_browser.navigate(state["url_current"][0])
+                        break
+                else              :
+                    logger.info(f"SKIPPED URL. Already visited: {url}")
         
         # Fetch current browser state via BrowserProxy.get_content()
         state["browser_state"][0] = await state["mcp_manager"].managed_browser.get_content()
@@ -651,6 +682,18 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
             f"{state['browser_state'][0]}\n"
             f"```\n\n"
         )
+
+        # BACKLOG: Oversized pages are hard-skipped for now (page is discarded and not saved).
+        # Later we might fix this behavior by salvaging such pages instead of dropping them,
+        # e.g. via aggressive DOM truncation, chunked summarization, or a two-pass
+        # links-only extraction, and possibly persist the skip in Redis to avoid re-fetching.
+        prompt_tokens = await get_tools_tokens_length(access_agent_prompt)
+        if prompt_tokens > llm_base_context_len :
+            logger.warning(f"OVERSIZED PAGE SKIPPED. url={state['url_current'][0]}, prompt_tokens={prompt_tokens} > context_budget={llm_base_context_len}")
+            state["browser_state"][0] = ""
+            state["page_history"].clear()
+            state["retry_counter"][0] = 0
+            return None
 
         # Query vLLM's generation
         input_messages = [ SystemMessage(content=access_agent_prompt),
@@ -793,7 +836,8 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                 relevance_match = re.search(r'RELEVANCE:\s*(RELEVANT|IRRELEVANT)', response.content, re.IGNORECASE)
                 if not relevance_match or relevance_match.group(1).upper() != "RELEVANT":
                     # IRRELEVANT  --  Discard page, but still mark as visited in RedisDB
-                    await state["redis_manager"].check_and_add(state["url_current"][0])
+                    redis_res = await state["redis_manager"].check_and_add(state["url_current"][0])
+                    logger.info(f"IRRELEVANT page. Marked as visited in Redis (add_status={redis_res}): {state['url_current'][0]}")
                 else                                                                    :  
                     # RELEVANT
                     type_match = re.search(r'TYPE:\s*(STORY|AGGREGATOR)', response.content, re.IGNORECASE)
@@ -814,17 +858,23 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                                 break  # File created successfully!
                             except FileExistsError :
                                 continue  # Another process created it, try another name
-                        await state["rabbit_manager"].publish_json({"url": state["url_current"][0],
-                                                                    "file_path": file_path,
-                                                                    "timestamp": state["date_str"],})
+                        rabbit_res = await state["rabbit_manager"].publish_json({"url": state["url_current"][0],
+                                                                                 "file_path": file_path,
+                                                                                 "timestamp": state["date_str"],})
+                        logger.info(f"STORY page. Published to RabbitMQ (publish_status={rabbit_res}): url={state['url_current'][0]}, file={file_path}")
                         state["pages_saved"][0] += 1
                         # Store visited URL in RedisDB
-                        await state["redis_manager"].check_and_add(state["url_current"][0])
+                        redis_res = await state["redis_manager"].check_and_add(state["url_current"][0])
+                        logger.info(f"STORY page. Marked as visited in Redis (add_status={redis_res}): {state['url_current'][0]}")
                     else                                                     :  # Aggregator page - DON'T store in RedisDB                        
-                        pass
+                        logger.debug(f"AGGREGATOR page. URL NOT marked as visited in Redis (eligible for revisit): {state['url_current'][0]}")
                     # Extract links if we have some hops
                     if  len(state["urls"]) < state["deepness_max"] and extracted_links :
-                        state["urls"].append(extracted_links)
+                        # Apriori site-specific pruning: drop known non-story branches
+                        # so they never enter the traversal stack.
+                        links_to_push = state["site_filter"].filter_urls(extracted_links)
+                        if links_to_push :
+                            state["urls"].append(links_to_push)
             state["browser_state"][0] = ""
         return None
 
@@ -860,7 +910,6 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                            "url_current"      : ["",],
                            "deepness_max"     : deepness_max,
                            "pages_saved"      : [0,],
-                           "pages_number"     : [0,],
                            "retries_max"      : retries_max,
                            "retry_counter"    : [0,],
                            "browser_state"    : ["",],
@@ -869,7 +918,8 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                            "mcp_manager"      : mcp_manager,
                            "rabbit_manager"   : rabbit_manager,
                            "redis_manager"    : redis_manager,
-                 })
+                           "site_filter"      : site_filter,
+                        })
     
     # External driver loop: reuses the compiled 'graph' across all URL iterations
     while state["urls"] and sum(map(len, state["urls"])) > 0 :
@@ -878,7 +928,6 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
         assert not len(state["browser_state"][0]) and not len(state["page_history"]) and not state["retry_counter"][0] , "Failure in agentic clean-up."
         state["url_current"][0] = ""
 
-    logger.info(f"Visited pages:    {state['pages_number'][0]}")
     logger.info(f"Saved pages:    {state['pages_saved'][0]}")
     logger.info("======================================================")
 
@@ -975,7 +1024,7 @@ async def run_stealth_graph(url_string : str = "https://ca.finance.yahoo.com/", 
         # Link RabbitMQ 
         async with RabbitMQClient(host=rabbit_host, port=rabbit_port,
                                   publish_queue_name="crawler_json_queue", receive_queue_name=None,
-                                  username="crawler", password="ceawler") as rabbit_manager:
+                                  username="crawler", password="crawler") as rabbit_manager:
             rabbit_err_code = await rabbit_manager.connect()
             if rabbit_err_code:
                 logger.error(f"Failed to connect RabbitMQ at host {rabbit_manager.host} port {rabbit_manager.port}")
@@ -998,6 +1047,7 @@ async def run_stealth_graph(url_string : str = "https://ca.finance.yahoo.com/", 
     return agentic_error_code
 
 
+# python3 ./src/crawler/crawler_agent.py -u "https://ca.finance.yahoo.com/"  -d 2 -f "./html" -n -1 -m 1 
 if __name__ == "__main__":
     """
     Main entry point for command-line execution.
@@ -1014,7 +1064,7 @@ if __name__ == "__main__":
     parser.add_argument("--pages_max",        "-n", type=int, default=-1,                              dest="pages_max",         help="Maximal number of pages to extract.")
     parser.add_argument("--retries_max",      "-m", type=int, default=1,                               dest="retries_max",       help="Maximal number of pages to extract.")
     parser.add_argument("--rabbit_host",     "-bh", type=str, default="localhost",                     dest="rabbit_host",       help="RabbitMQ host.")
-    parser.add_argument("--rabbit_port",     "-bp", type=int, default=15672,                           dest="rabbit_port",       help="RabbitMQ port.")
+    parser.add_argument("--rabbit_port",     "-bp", type=int, default=5672,                            dest="rabbit_port",       help="RabbitMQ port.")
     parser.add_argument("--redis_host",      "-rh", type=str, default="localhost",                     dest="redis_host",        help="RedisDB host.")
     parser.add_argument("--redis_port",      "-rp", type=int, default=6379,                            dest="redis_port",        help="RedisDB port.")
     args = parser.parse_args()
@@ -1032,6 +1082,5 @@ if __name__ == "__main__":
     logger.info(f"Agent finished with {return_code} error code.")
     
 # Backlog:
-# Add limit on tokens count for big pages
-# Add integration unittes with debug flag
-# Add destination folder argument 
+# Replace the hard-skip of oversized pages with proper handling (chunking / DOM truncation / salvage links)
+

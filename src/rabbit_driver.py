@@ -1,26 +1,30 @@
 """
-RabbitMQ driver module with both real and mock implementations.
+RabbitMQ driver module with both real and readonly implementations.
 
-This module provides a unified RabbitMQ client that can operate in either
-real mode (connecting to an actual RabbitMQ server) or mock mode (using
-in-memory storage for testing/debugging).
+This module provides a unified RabbitMQ client that always connects to a
+real RabbitMQ server. In readonly mode (DEBUG env var or readonly=True)
+reads are non-destructive: a message is taken one at a time and put back
+into the queue (the queue is never drained), while writes go to internal
+storage so the server remains unchanged.
 
 Usage:
-    # Use real RabbitMQ (default)
+    # Production (default)
     rabbit_client = RabbitMQClient(host="localhost", port=5672, vhost="/")
-    
-    # Use mock RabbitMQ
+
+    # Readonly mode
     rabbit_client = RabbitMQClient(readonly=True)
-    
+
     # Or use environment variable DEBUG
     import os
-    os.environ['DEBUG'] = 'true'  # Will automatically use mock
+    os.environ['DEBUG'] = 'true'  # Will automatically enable readonly mode
 """
 
 import logging
 import json
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any
 from collections import deque
+import aio_pika
+#from aio_pika.exceptions import QueueEmpty, ChannelNotFoundEntity, AMQPChannelError
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -35,24 +39,24 @@ logger.addHandler(console_handler)
 
 class RabbitMQClient:
     """
-    Unified RabbitMQ client that supports both real and mock implementations.
-    
-    This class acts as a facade that delegates to either the real RabbitMQ
-    client implementation or a mock implementation based on the `readonly`
-    parameter or the DEBUG environment variable.
-    
+    Unified RabbitMQ client that always connects to a real RabbitMQ server.
+
+    In readonly mode, reads are non-destructive: each received message is
+    requeued (the queue is never drained, so runs can be repeated), and
+    writes go to an internal buffer so the server remains unchanged.
+
     Attributes:
-        _connected: Whether the mock client is connected (mock only).
-        _messages: Dictionary mapping queue names to message queues (mock only).
-        _publish_count: Counter for number of published messages (mock only).
-    
+        _connected: Whether the client is connected.
+        _messages: Dictionary mapping queue names to buffered messages (readonly writes).
+        _publish_count: Counter for number of buffered messages (readonly writes).
+
     Example:
-        # Real RabbitMQ
+        # Production
         async with RabbitMQClient(readonly=False) as client:
             await client.connect()
             await client.publish_json({"data": "message"})
-        
-        # Mock RabbitMQ
+
+        # Readonly mode
         async with RabbitMQClient(readonly=True) as client:
             await client.connect()
             await client.publish_json({"data": "message"})
@@ -80,14 +84,16 @@ class RabbitMQClient:
             receive_queue_name: Default queue name for receiving.
             username: RabbitMQ username.
             password: RabbitMQ password.
-            readonly: If True, uses mock implementation. If False, uses real RabbitMQ.
-                      If None, checks the DEBUG environment variable.
+            readonly: If True, enables readonly mode (real connection,
+                      non-destructive reads, buffered writes). If False, uses
+                      full real RabbitMQ semantics. If None, checks the DEBUG
+                      environment variable.
         """
-        # Determine if we should use mock implementation
+        # Determine if we should use readonly mode
         if readonly is None:
             import os
             readonly = os.environ.get('DEBUG', '').lower() in ('true', '1', 'yes')
-        
+
         self.readonly = readonly
         self._host = host
         self._port = port
@@ -99,7 +105,7 @@ class RabbitMQClient:
         self._connection = None
         self._channel = None
         
-        # Mock-specific attributes
+        # Readonly-mode attributes (write buffer + connection flag)
         self._connected = False
         self._messages: Dict[str, deque] = {}
         self._publish_count = 0
@@ -142,66 +148,59 @@ class RabbitMQClient:
 
     async def connect(self) -> int:
         """
-        Connect to RabbitMQ (real or mock based on configuration).
-        
+        Connect to the real RabbitMQ server.
+
+        In readonly mode the same real connection is used, but reads become
+        non-destructive (messages are requeued) and writes are buffered.
+
         Returns:
             0 on success, -1 on failure.
         """
-        if self.readonly:
-            # Mock implementation
-            if self._connected:
-                logger.error("RabbitMQ ERROR. Client is already opened!")
-                return -1
-            try:
-                self._connected = True
-                self._messages = {}
-                logger.info(f"Mock RabbitMQ connected to {self._host}:{self._port}")
-                return 0
-            except Exception as e:
-                logger.error(f"RabbitMQ ERROR. Failed to connect (mock), error: {e}")
-                return -1
-        else:
-            # Real implementation
-            if self._connection is not None:
-                logger.error("RabbitMQ ERROR. Client is already opened!")
-                return -1
-            try:
-                import aio_pika
-                # connect_robust automatically handles reconnects
-                self._connection = await aio_pika.connect_robust(
-                    host=self._host,
-                    port=self._port,
-                    virtualhost=self._vhost,
-                    login=self._username,
-                    password=self._password
-                )
-                self._channel = await self._connection.channel()
+        if self._connection is not None:
+            logger.error("RabbitMQ ERROR. Client is already opened!")
+            return -1
+        try:
+            # connect_robust automatically handles reconnects
+            self._connection = await aio_pika.connect_robust(
+                host=self._host,
+                port=self._port,
+                virtualhost=self._vhost,
+                login=self._username,
+                password=self._password
+            )
+            self._channel = await self._connection.channel()
+            self._connected = True
+            if self.readonly:
+                logger.info(f"RabbitMQ connected to {self._host}:{self._port} (readonly: non-destructive reads, buffered writes)")
+            else:
                 logger.info(f"RabbitMQ connected to {self._host}:{self._port}")
-                return 0
-            except Exception as e:
-                logger.error(f"RabbitMQ ERROR. Failed to connect, error: {e}")
-                self._connection = None
-                self._channel = None
-                return -1
+            return 0
+        except Exception as e:
+            logger.error(f"RabbitMQ ERROR. Failed to connect, error: {e}")
+            self._connection = None
+            self._channel = None
+            self._connected = False
+            return -1
 
     async def disconnect(self) -> None:
         """
         Gracefully disconnect and clean up all resources.
-        
+
         This method reverses the connection process by closing the connection
-        in the correct order and clearing internal state.
+        in the correct order and clearing internal state (including the
+        readonly write buffer).
         """
+        if self._channel is not None and not self._channel.is_closed:
+            await self._channel.close()
+            self._channel = None
+        if self._connection is not None and not self._connection.is_closed:
+            await self._connection.close()
+            self._connection = None
+        self._connected = False
         if self.readonly:
-            self._connected = False
             self._messages = {}
-            logger.info("Mock RabbitMQ connection closed.")
+            logger.info("RabbitMQ connection closed (readonly).")
         else:
-            if self._channel is not None and not self._channel.is_closed:
-                await self._channel.close()
-                self._channel = None
-            if self._connection is not None and not self._connection.is_closed:
-                await self._connection.close()
-                self._connection = None
             logger.info("RabbitMQ connection closed.")
 
     async def restart(self) -> int:
@@ -227,17 +226,20 @@ class RabbitMQClient:
 
     async def publish_json(self, data: dict, queue_name: Optional[str] = None) -> int:
         """
-        Publish a JSON message (real or mock based on configuration).
-        
+        Publish a JSON message.
+
+        In readonly mode the message is buffered internally (the real server
+        is not modified); in production mode it is published to the broker.
+
         Args:
             data: The JSON data to publish.
             queue_name: The queue name to publish to.
-            
+
         Returns:
             1 on success, 0 on failure.
         """
         if self.readonly:
-            return await self._publish_json_mock(data, queue_name)
+            return await self._publish_json_buffered(data, queue_name)
         else:
             return await self._publish_json_real(data, queue_name)
 
@@ -247,17 +249,12 @@ class RabbitMQClient:
             logger.error("RabbitMQ ERROR. Client is not connected!")
             return 0
         try:
-            import aio_pika
             message_bytes = json.dumps(data).encode("utf-8")
             if queue_name is None:
                 queue_name = self._publish_queue_name
             assert queue_name is not None, "RabbitMQ ERROR. Publishing into unspecified queue!"
             await self._channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=message_bytes,
-                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-                    content_type="application/json"
-                ),
+                aio_pika.Message(body=message_bytes, delivery_mode=aio_pika.DeliveryMode.PERSISTENT, content_type="application/json"),
                 routing_key=queue_name
             )
             return 1
@@ -265,8 +262,8 @@ class RabbitMQClient:
             logger.error(f"RabbitMQ ERROR. Failed to publish a message {e}")
             return 0
 
-    async def _publish_json_mock(self, data: dict, queue_name: Optional[str] = None) -> int:
-        """Mock RabbitMQ implementation of publish_json."""
+    async def _publish_json_buffered(self, data: dict, queue_name: Optional[str] = None) -> int:
+        """Readonly implementation of publish_json (buffered internally, the server is not modified)."""
         if not self._connected:
             logger.error("RabbitMQ ERROR. Client is not connected!")
             return 0
@@ -274,13 +271,13 @@ class RabbitMQClient:
             if queue_name is None:
                 queue_name = self._publish_queue_name
             assert queue_name is not None, "RabbitMQ ERROR. Publishing into unspecified queue!"
-            
+
             if queue_name not in self._messages:
                 self._messages[queue_name] = deque()
-            
+
             self._messages[queue_name].append(data)
             self._publish_count += 1
-            logger.debug(f"Mock RabbitMQ published message to queue '{queue_name}': {data}")
+            logger.debug(f"Readonly RabbitMQ buffered message to queue '{queue_name}': {data}")
             return 1
         except Exception as e:
             logger.error(f"RabbitMQ ERROR. Failed to publish a message {e}")
@@ -288,70 +285,99 @@ class RabbitMQClient:
 
     async def receive_json(self, queue_name: Optional[str] = None) -> Tuple[int, Optional[dict]]:
         """
-        Receive a JSON message (real or mock based on configuration).
-        
+        Receive a JSON message, one at a time.
+
+        In readonly mode the message is requeued right after being read, so
+        the queue is never drained and the run can be repeated.
+
         Args:
             queue_name: The queue name to receive from.
-            
+
         Returns:
             Tuple of (status_code, message):
             - (1, message) if message was received
-            - (0, None) if queue is empty
+            - (0, None) if queue is empty (or does not exist, readonly mode)
             - (-1, None) on error
         """
         if self.readonly:
-            return await self._receive_json_mock(queue_name)
+            return await self._receive_json_readonly(queue_name)
         else:
             return await self._receive_json_real(queue_name)
 
     async def _receive_json_real(self, queue_name: Optional[str] = None) -> Tuple[int, Optional[dict]]:
         """Real RabbitMQ implementation of receive_json."""
+        if self._channel is None or self._channel.is_closed :
+            logger.error("RabbitMQ error. Client is not connected!")
+            return (-1, None)
+        if queue_name is None :
+            queue_name = self._receive_queue_name
+        assert queue_name is not None, "RabbitMQ ERROR. Receiving from unspecified queue!"
+        # Create queue handle locally (bypasses broker declare and requires ONLY 'Read' permissions)
+        queue = aio_pika.Queue(channel=self._channel, name=queue_name, durable=True,
+                               exclusive=False, auto_delete=False, arguments=None)
+        try :
+            # Fetch single message; fails immediately if empty or missing
+            message = await queue.get(fail=True)
+        except aio_pika.exceptions.QueueEmpty :
+            return (0, None)
+        except (aio_pika.exceptions.ChannelNotFoundEntity, aio_pika.exceptions.AMQPChannelError, Exception) as fetch_err :
+            logger.debug(f"RabbitMQ: queue '{queue_name}' fetch failed: {fetch_err}")
+            # Re-open channel if RabbitMQ closed it on failure
+            if self._channel.is_closed :
+                self._channel = await self._connection.channel()
+            return (0, None)
+        # Acknowledge and process message upon successful JSON decode
+        async with message.process() :
+            try :
+                payload = json.loads(message.body.decode("utf-8"))
+                return (1, payload)
+            except json.JSONDecodeError as e :
+                logger.error(f"RabbitMQ ERROR. Failed to decode JSON payload: {e}")
+                return (-1, None)
+
+    async def _receive_json_readonly(self, queue_name: Optional[str] = None) -> Tuple[int, Optional[dict]]:
+        """
+        Readonly implementation of receive_json.
+
+        Reads one message from the real broker WITHOUT removing it: the
+        message is retrieved and immediately requeued via reject(requeue=True),
+        ensuring the queue is non-destructively read and never drained.
+        """
         if self._channel is None or self._channel.is_closed:
             logger.error("RabbitMQ error. Client is not connected!")
             return (-1, None)
-        try:
-            from aio_pika.exceptions import QueueEmpty
-            if queue_name is None:
-                queue_name = self._receive_queue_name
-            assert queue_name is not None, "RabbitMQ ERROR. Receiving from unspecified queue!"
-            queue = await self._channel.declare_queue(queue_name, passive=True)
-            # fail_if_empty=True ensures it returns immediately instead of waiting
-            message = await queue.get(fail_if_empty=True)
-            # async with message.process() ensures the message is acknowledged
-            async with message.process():
-                try:
-                    payload = json.loads(message.body.decode("utf-8"))
-                    return (1, payload)
-                except json.JSONDecodeError as e:
-                    logger.error(f"RabbitMQ ERROR. Failed to decode JSON payload: {e}")
-                    return (-1, None)
-        except QueueEmpty:
+        if queue_name is None :
+            queue_name = self._receive_queue_name
+        assert queue_name is not None, "RabbitMQ ERROR. Receiving from unspecified queue!"
+        # Instantiate queue locally in Python without sending AMQP Queue.Declare frame
+        queue = aio_pika.Queue(channel=self._channel, name=queue_name, durable=True,
+                               exclusive=False, auto_delete=False, arguments=None)
+        try :
+            message = await queue.get(fail=True)
+        except aio_pika.exceptions.QueueEmpty :
             return (0, None)
-        except Exception as e:
+        except (aio_pika.exceptions.ChannelNotFoundEntity, aio_pika.exceptions.AMQPChannelError) as fetch_err :
+            logger.debug(f"Readonly RabbitMQ: queue '{queue_name}' fetch failed: {fetch_err}")
+            # Re-open channel if RabbitMQ closed it on failure
+            if self._channel.is_closed:
+                self._channel = await self._connection.channel()
+            return (0, None)
+        except Exception as e :
             logger.error(f"RabbitMQ ERROR. Failed to get message from queue '{queue_name}': {e}")
+            if self._channel.is_closed:
+                self._channel = await self._connection.channel()
+            return (-1, None)
+        # Non-destructive read: put message back onto the queue immediately
+        await message.reject(requeue=True)
+        try :
+            payload = json.loads(message.body.decode("utf-8"))
+            logger.debug(f"Readonly RabbitMQ read message from queue '{queue_name}': {payload}")
+            return (1, payload)
+        except json.JSONDecodeError as e :
+            logger.error(f"RabbitMQ ERROR. Failed to decode JSON payload: {e}")
             return (-1, None)
 
-    async def _receive_json_mock(self, queue_name: Optional[str] = None) -> Tuple[int, Optional[dict]]:
-        """Mock RabbitMQ implementation of receive_json."""
-        if not self._connected:
-            logger.error("RabbitMQ error. Client is not connected!")
-            return (-1, None)
-        try:
-            if queue_name is None:
-                queue_name = self._receive_queue_name
-            assert queue_name is not None, "RabbitMQ ERROR. Receiving from unspecified queue!"
-            
-            if queue_name not in self._messages or len(self._messages[queue_name]) == 0:
-                return (0, None)
-            
-            message = self._messages[queue_name].popleft()
-            logger.debug(f"Mock RabbitMQ received message from queue '{queue_name}': {message}")
-            return (1, message)
-        except Exception as e:
-            logger.error(f"RabbitMQ ERROR. Failed to get message from queue '{queue_name}': {e}")
-            return (-1, None)
-
-    # Mock-only methods (for testing purposes)
+    # Readonly-buffer helpers (for testing purposes)
     async def get_queue_size(self, queue_name: Optional[str] = None) -> int:
         """Get the number of messages in a queue (for testing purposes)."""
         if queue_name is None:
@@ -361,12 +387,12 @@ class RabbitMQClient:
         return len(self._messages[queue_name])
 
     async def clear_queue(self, queue_name: Optional[str] = None) -> None:
-        """Clear all messages from a queue (for testing purposes)."""
+        """Clear all buffered messages from a queue (for testing purposes)."""
         if queue_name is None:
             queue_name = self._publish_queue_name
         if queue_name is not None and queue_name in self._messages:
             self._messages[queue_name].clear()
-            logger.debug(f"Mock RabbitMQ cleared queue '{queue_name}'")
+            logger.debug(f"Readonly RabbitMQ cleared buffer of queue '{queue_name}'")
 
     async def __aenter__(self):
         return self
