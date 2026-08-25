@@ -49,6 +49,26 @@ class TestRedisDBClientReadonly:
         await client.close()
 
     @pytest.mark.asyncio
+    async def test_check_does_not_add_url(self):
+        await _cleanup_redis_test_data()
+        client = RedisDBClient(readonly=True)
+        await client.connect()
+
+        result = await client.check_only("https://check_test.com")
+        assert result == 0, "Should return 0 for unvisited URL"
+
+        result = await client.check_and_add("https://check_test.com")
+        assert result == 1
+
+        result = await client.check_only("https://check_test.com")
+        assert result == 1, "Should return 1 for buffered URL in readonly mode"
+
+        assert len(client._visited_urls) == 1
+
+        await _cleanup_redis_test_data()
+        await client.close()
+
+    @pytest.mark.asyncio
     async def test_multiple_urls(self):
         await _cleanup_redis_test_data()
         client = RedisDBClient(readonly=True)
@@ -138,6 +158,29 @@ class TestRedisDBClientProduction:
 
         result = await client.get_visited_urls()
         assert test_url in result
+
+        await _cleanup_redis_test_data()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_check_is_read_only(self):
+        """Verify that check() is a pure read and does not modify the set."""
+        await _cleanup_redis_test_data()
+        client = RedisDBClient(readonly=False)
+        await client.connect()
+
+        test_url = "https://check_no_write.com"
+        result = await client.check_only(test_url)
+        assert result == 0, "New URL must return 0"
+
+        count = await client.get_visited_count()
+        assert count == 0, "check() must not add the URL to Redis"
+
+        result = await client.check_and_add(test_url)
+        assert result == 1
+
+        result = await client.check_only(test_url)
+        assert result == 1, "Added URL must return 1"
 
         await _cleanup_redis_test_data()
         await client.close()
