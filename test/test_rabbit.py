@@ -5,10 +5,13 @@ This module tests the mock RabbitMQClient implementation to ensure it correctly 
 the behavior of the real client for debugging and unit testing purposes.
 """
 
-import asyncio
-import pytest
-import sys
+import base64
+import json
 import os
+import pytest
+import re
+import sys
+import urllib.request
 
 # Add the src directory to the path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
@@ -106,6 +109,54 @@ async def test_debug_mode_switch():
     assert hasattr(readonly_redis, 'connect')
     assert hasattr(readonly_redis, 'close')
     assert hasattr(readonly_redis, 'check_and_add')
+
+
+@pytest.mark.asyncio
+async def test_llm_timeout_tuning():
+    # The LLM liveness tuning of the agent is env-overridable at import
+    # time with the documented defaults (2h read cap, 600s ping gate)
+    import importlib
+    scrapper_dir = os.path.join(os.path.dirname(__file__), '..', 'src', 'scrapper')
+    if scrapper_dir not in sys.path:
+        sys.path.insert(0, scrapper_dir)
+    os.environ["LLM_READ_TIMEOUT"] = "1234"
+    os.environ["LLM_PING_TIMEOUT"] = "4321"
+    try:
+        import scrapper_agent
+        importlib.reload(scrapper_agent)
+        assert scrapper_agent.LLM_READ_TIMEOUT_S == 1234.0
+        assert scrapper_agent.LLM_PING_TIMEOUT_S == 4321.0
+    finally:
+        del os.environ["LLM_READ_TIMEOUT"]
+        del os.environ["LLM_PING_TIMEOUT"]
+    importlib.reload(scrapper_agent)
+    assert scrapper_agent.LLM_READ_TIMEOUT_S == 7200.0
+    assert scrapper_agent.LLM_PING_TIMEOUT_S == 600.0
+
+
+def test_broker_config_sanity():
+    # Production broker topology and permissions via the management API:
+    # read-only probes, no AMQP connection, no objects created.
+    # Guards the ACCESS_REFUSED failure class: a user whose `write` regex
+    # covers the queue name but not the exchange (`amq.default`) publishes
+    # into a silent requeue loop instead of failing loudly.
+    auth = {"Authorization": "Basic " + base64.b64encode(b"guest:guest").decode()}
+
+    def get(path):
+        req = urllib.request.Request("http://localhost:15672/api" + path, headers=auth)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    queues = {q["name"] for q in get("/queues/%2f")}
+    assert {"crawler_json_queue", "scrapper_json_queue"} <= queues
+
+    perms = {p["user"]: p for p in get("/permissions/")}
+    assert re.search(perms["scrapper"]["write"], "amq.default"), \
+        "scrapper must be able to publish (write the default exchange)"
+    assert re.search(perms["scrapper"]["read"], "crawler_json_queue"), \
+        "scrapper must be able to consume crawler_json_queue"
+    assert re.search(perms["crawler"]["write"], "amq.default"), \
+        "crawler must be able to publish (write the default exchange)"
 
 
 if __name__ == "__main__":

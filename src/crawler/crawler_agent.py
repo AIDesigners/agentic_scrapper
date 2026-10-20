@@ -10,22 +10,20 @@ console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 # --- KEEPING FILE OUTPUT COMMENTED BUT WORKING ---
-# file_handler = logging.FileHandler('web_analysis_agent.log')
+# file_handler = logging.FileHandler('crawler_agent.log')
 # file_handler.setLevel(logging.DEBUG)
 # file_handler.setFormatter(formatter)
 # logger.addHandler(file_handler)
 
-from typing import TypedDict, Optional, List, Dict, Tuple, Any, Protocol, Set
+from typing import TypedDict, Optional, List, Dict, Any
 import os
 import sys
 import asyncio
-from contextlib import asynccontextmanager
 import re
 import json
 import datetime
 import uuid
 import gzip
-import httpx
 
 # Make the parent 'src' directory importable so that modules moved there
 # (rabbit_driver, redis_driver) can be imported as top-level modules.
@@ -33,30 +31,15 @@ _SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _SRC_ROOT)
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, RemoveMessage
-from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.sessions import ClientSession
-from langchain_mcp_adapters.tools import load_mcp_tools
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 
 
-from web_tools import clean_dom
+from web_tools import clean_dom, BrowserProxy, StealthMCPManager
+from agent_tools import BASE_URL, BASE_API_KEY, MODEL_NAME, get_tools_tokens_length, truncate_prompt
 
-# Optional site-specific apriori traversal filters (boosters), selected by the
-# entry URL. See crawler_site_filters.py (same dir) for the registry + boosters.
-from crawler_site_filters import SiteFilter, select_site_filter
-
-BASE_URL="http://ifo4:8000"
-BASE_API_KEY="alex_llm_qwen"
-#MODEL_NAME="poolside/Laguna-XS-2.1-NVFP4"
-#MODEL_NAME="QuantTrio/Qwen3.6-27B-AWQ"
-MODEL_NAME="unsloth/Qwen3.8-27B-NVFP4"
 LLM_BASE_CONTEXT_LEN = 163840 # 131072 # 196608 
 LLM_MAX_OUTPUT_TOKENS = 32768
-#python3  -m vllm.entrypoints.openai.api_server --model unsloth/Qwen3.8-27B-NVFP4 --host 0.0.0.0 --port 8000 --api-key alex_llm_qwen \
-#        --max-model-len 163840 --kv-cache-dtype fp8 --gpu-memory-utilization 0.96 --max-num-seqs 1 --max-num-batched-tokens 8192    \
-#        --enable-auto-tool-choice --tool-call-parser qwen3_xml --enable-prefix-caching --reasoning-parser qwen3 --trust-remote-code \
-#        --enable-chunked-prefill --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
 
 
 # --- DEBUG FLAG: Use mock implementations for testing/debugging ---
@@ -75,408 +58,8 @@ if DEBUG:
 from rabbit_driver import RabbitMQClient
 from redis_driver import RedisDBClient
 
-# Define structural protocols to avoid importing from the raw 'mcp' package
-class MCPContentBlock(Protocol):
-    text: str
-class MCPToolResult(Protocol):
-    content: List[MCPContentBlock]
-class MCPSession(Protocol):
-    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> MCPToolResult : ...
-
-# The proxy browser class under controll of MCP
-class BrowserProxy :
-    def __init__(self, logger : logging.Logger, _mcp_session : ClientSession, browser_instance_id : str) -> None :
-        self.logger = logger
-        self._mcp_session = _mcp_session
-        self.browser_instance_id = browser_instance_id
-
-    # Implementing __call__ allows you to do: await browser("tool_name", {...})
-    async def __call__(self, tool_name: str, args: Dict[str, Any] | None = None) -> Optional[MCPToolResult] :
-        assert self.browser_instance_id is not None , "Managed browser is not initialized!"
-        # 1. PRE-CALL HEALTH TEST
-        try:
-            result = await self._mcp_session.call_tool("execute_script",
-                                                      {"instance_id": self.browser_instance_id, "script": "1"})
-            assert not getattr(result, "isError", False)
-        except Exception:
-            # Captures library-level connection, read, or stream timeouts cleanly
-            return None
-        # 2. TIMEOUT PROTECTED TOOL EXECUTION
-        full_args = args or {}
-        full_args["instance_id"] = self.browser_instance_id
-        return await self._mcp_session.call_tool(tool_name, full_args)
-
-    # The routine to open page
-    async def navigate(self, url_string : str) -> Optional[MCPToolResult] :
-        mcp_response = await self("navigate", {"url" : url_string, "wait_until" : "networkidle"})
-        return mcp_response if mcp_response and not getattr(mcp_response, "isError", False) else None
-
-    # Accessing the page content
-    async def get_content(self, max_retries: int = 3) -> str:
-        for attempt in range(max_retries):
-            try : # Wrap it in try/except because it sometimes throw exceptions on MCP side
-                mcp_response = await self("get_page_content")
-            except :
-                self.logger.warning(f"MCP transport error on attempt {attempt + 1}: {e}")
-                mcp_response = None
-            if mcp_response is None : return None
-            # --- 1. IF JS FAILED / PAGE CRASHED ---
-            if getattr(mcp_response, "isError", False) :
-                self.logger.warning(f"JS/Page error on attempt {attempt + 1} of {max_retries}.")
-                if attempt < max_retries - 1:
-                    self.logger.warning("Triggering native page reload...")
-                    mcp_response = await self("reload_page")
-                    if not mcp_response : return None
-                continue
-            # --- 2. IF SUCCESSFUL ---
-            if mcp_response and getattr(mcp_response, "content", None):
-                raw_content = mcp_response.content[0].text.strip()
-                if raw_content.startswith("{") and raw_content.endswith("}"):
-                    try:
-                        meta = json.loads(raw_content)
-                        if isinstance(meta, dict) and "file_path" in meta:
-                            file_path = meta["file_path"]
-                            if os.path.exists(file_path):
-                                with open(file_path, "r", encoding="utf-8") as f:
-                                    return f.read()
-                            else:
-                                self.logger.error(f"Offloaded file not found at {file_path}")
-                                return ""
-                    except json.JSONDecodeError:
-                        pass
-                return raw_content
-        # --- 3. IF ALL RETRIES FAIL ---
-        self.logger.error(f"Failed to extract content after {max_retries} attempts. Returning empty page.")
-        return ""
-
-    # The routine to collect all liks on a page
-    async def get_links(self) -> Optional[Set[str]] :
-        js_script = """
-        (() => {
-            const links = Array.from(document.querySelectorAll('a[href]'));
-            const webPageRegex = /\\.(png|jpe?g|gif|svg|webp|pdf|zip|tar|gz|mp3|mp4|css|js)$/i;
-            return links
-                .map(a => a.href)
-                .filter(href => {
-                    try {
-                        const url = new URL(href);
-                        // Ensure it's a web protocol and doesn't match static asset extensions
-                        return (url.protocol === 'http:' || url.protocol === 'https:') 
-                               && !webPageRegex.test(url.pathname);
-                    } catch (e) {
-                        return false;
-                    }
-                });
-        })()
-        """
-        # JavaScript snippet to filter for actual web pages, ignoring typical asset files
-        mcp_response = await self._mcp_session.call_tool("execute_script", {
-            "instance_id": self.browser_instance_id,
-            "script": js_script
-        })
-        if mcp_response and not getattr(mcp_response, "isError", False) :
-            data = json.loads(mcp_response.content[0].text)
-            return {item.get('value') for item in data.get('result', []) if item.get('value')}
-        else                                     :
-            return None
-
-
-from contextlib import AsyncExitStack
-class StealthMCPManager:
-    """
-    Manages the complete lifecycle of an MCP (Model Context Protocol) server and browser.
-    This class provides a robust interface for connecting to, controlling, and disconnecting
-    from a stealth browser MCP server. It handles all error cases gracefully by returning
-    error codes instead of raising exceptions, making it suitable for production use.
-    The manager follows a strict hierarchy:
-        Client -> Session -> Browser Instance -> Tools
-    Attributes:
-        ERROR_MCP_CODES_WORDS (dict): Mapping of error codes to human-readable strings.
-        ERROR_MCP_CODES_NUMS (dict): Reverse mapping for checking if an error code is valid.
-        folder (str): Base directory for the stealth-browser-mcp installation.
-        _server_config (dict): Configuration for MCP server connection.
-        _mcp_client: The MCP client instance for managing server connections.
-        _mcp_session: The active MCP session for tool invocation.
-        managed_browser (str): Instance ID of the currently managed browser.
-        _tools (list): List of loaded MCP tools available for browser automation.
-        _tools_summary (str): Human-readable summary of available tools.
-    Error Codes:
-        0: ERROR_MCP_OK - Success / no error
-        1: ERROR_MCP_ALREADY_CONNECTED - Client already exists, must close first
-        2: ERROR_MCP_NOT_CONNECTED - Session is None, need to connect first
-        3: ERROR_MCP_CLIENT_CREATE - Failed to instantiate MultiServerMCPClient
-        4: ERROR_MCP_SESSION_START - Failed to start MCP session
-        5: ERROR_MCP_LOAD_TOOLS - Failed to load tools from session
-        6: ERROR_MCP_SESSION_STOP - Failed to stop session
-        7: ERROR_MCP_CLIENT_STOP - Failed to stop client
-        8: ERROR_MCP_BROWSER_STOP - Failed to close browser
-        9: ERROR_MCP_BROWSER_SPAWN - Failed to spawn browser
-        10: ERROR_MCP_TOOL_CALL - Failed to call an MCP tool
-    Example:
-        async with StealthMCPManager() as manager:
-            await manager.connect()
-            await manager.create_managed_browser(headless=True)
-            # ... use browser ...
-            await manager.disconnect()
-    """
-    ERROR_MCP_CODES_WORDS = { 0: "ERROR_MCP_OK",
-                              1: "ERROR_MCP_ALREADY_CONNECTED",
-                              2: "ERROR_MCP_NOT_CONNECTED",
-                              3: "ERROR_MCP_CLIENT_CREATE",
-                              4: "ERROR_MCP_SESSION_START",
-                              5: "ERROR_MCP_LOAD_TOOLS",
-                              6: "ERROR_MCP_SESSION_STOP",
-                              7: "ERROR_MCP_CLIENT_STOP",
-                              8: "ERROR_MCP_BROWSER_STOP",
-                              9: "ERROR_MCP_BROWSER_SPAWN",
-                             10: "ERROR_MCP_BROWSER_NOT_EXISTS",
-                             11: "ERROR_MCP_TOOL_CALL",
-    }
-    ERROR_MCP_CODES_NUMS = {value: key for (key, value) in ERROR_MCP_CODES_WORDS.items()}
-
-    def __init__(self, logger: Optional[logging.Logger], folder: str = "/home/ayakovenko/nila/stealth-browser-mcp/") -> None:
-        """
-        Initialize the StealthMCPManager with default configuration.
-        Sets up the server configuration for connecting to the stealth-browser MCP server.
-        The configuration includes environment variables for Chrome/Chromium paths and
-        display settings for headless operation.
-        Args:
-            folder (str): Path to the stealth-browser-mcp installation directory.
-                Defaults to "/home/ayakovenko/nila/stealth-browser-mcp/".
-        Note:
-            The server_config dictionary is hardcoded for the specific stealth-browser
-            setup. It includes:
-            - transport: "stdio" for standard input/output communication
-            - command: Python interpreter path
-            - args: Server script path
-            - env: Environment variables for display and browser executable paths
-        """
-        self.folder = folder
-        self.logger = logger
-        self._server_config = {
-            "stealth-browser": {
-                "transport": "stdio",
-                "command": os.path.join(folder, "./bin/python3"),
-                "args": [os.path.join(folder, "./src/server.py")],
-                "env": {
-                    "DISPLAY": ":1",
-                    "CHROME_PATH": "/home/ayakovenko/nila/flatpak-chromium.bash",
-                    "BROWSER_EXECUTABLE_PATH": "/home/ayakovenko/nila/flatpak-chromium.bash",
-                    "PUPPETEER_EXECUTABLE_PATH": "/home/ayakovenko/nila/flatpak-chromium.bash"
-                }
-            }
-        }
-        # Type hints assumed from external imports like MultiServerMCPClient, MCPSession, BrowserProxy
-        self._mcp_client = None
-        self._mcp_session = None
-        self._managed_browser = None
-        self._tools: List = []
-        self._tools_summary: str = ""
-        # AsyncExitStack manages async context managers safely without breaking AnyIO tasks
-        self._exit_stack = None
-    @property
-    def session(self):
-        return self._mcp_session
-
-    @property
-    def managed_browser(self):
-        return self._managed_browser
-
-    @property
-    def tools(self):
-        return self._tools
-
-    @property
-    def tools_summary(self):
-        return self._tools_summary
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.disconnect()
-
-    async def _close_managed_browser(self):
-        """Internal helper to close the browser instance safely."""
-        if self._mcp_session and self._managed_browser:
-            try:
-                await asyncio.wait_for(self._mcp_session.call_tool("close_instance", {"instance_id" : self.managed_browser.browser_instance_id }), timeout=15.0)
-            except Exception as e:
-                if self.logger:
-                    self.logger.error(f"Error while closing managed browser: {e}")
-            finally:
-                self._managed_browser = None
-
-    async def disconnect(self):
-        """
-        Gracefully disconnect and clean up all resources.
-        This method reverses the connection process by closing resources in the correct order:
-        1. Closes the managed browser if one exists
-        2. Exits the MCP session and client seamlessly using AsyncExitStack
-        3. Clears the tools list and summary
-        Returns:
-            None
-        Side Effects:
-            - Closes active browser instance if managed_browser is not empty
-            - Sets self._mcp_session to None
-            - Sets self._mcp_client to None
-            - Clears self._tools and self._tools_summary
-        """
-        # 1. Manually close the browser via the active session first
-        await self._close_managed_browser()
-        # 2. Use the AsyncExitStack to properly close AnyIO scopes and contexts 
-        # (This replaces the manual __aexit__ calls which caused RuntimeErrors)
-        if hasattr(self, '_exit_stack') and self._exit_stack :
-            await self._exit_stack.aclose()
-            self._exit_stack = None
-        # 3. Clean up internal state
-        self._mcp_session = None
-        self._mcp_client = None
-        self._tools = []
-        self._tools_summary = ""
-
-    async def connect(self) -> int:
-        """
-        Establish connection to the MCP server and load available tools.
-        This method performs the complete connection sequence:
-        1. Creates the MultiServerMCPClient with the server configuration
-        2. Establishes an asynchronous session with the stealth-browser server
-        3. Loads all available tools for browser automation
-        Returns:
-            int: Error code from ERROR_MCP_CODES_NUMS:
-                - ERROR_MCP_OK (0): Connection successful, tools loaded
-                - ERROR_MCP_ALREADY_CONNECTED (1): Client already exists
-                - ERROR_MCP_CLIENT_CREATE (3): Failed to create client
-                - ERROR_MCP_SESSION_START (4): Failed to start session
-                - ERROR_MCP_LOAD_TOOLS (5): Failed to load tools
-        """
-        if self._mcp_session is not None or self._exit_stack is not None :
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_ALREADY_CONNECTED"]
-
-        # Step 1: Create Client
-        try:
-            # Recreate the stack so the object can be connect()'d again
-            self._exit_stack = AsyncExitStack()
-            self._mcp_client = MultiServerMCPClient(self._server_config)
-            # Note: If MultiServerMCPClient is itself an async context manager, you would enter it here:
-            # self._mcp_client = await self._exit_stack.enter_async_context(self._mcp_client)
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to instantiate MultiServerMCPClient(server_config): {e}")
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_CLIENT_CREATE"]
-        # Step 2: Start Session
-        try:
-            # Safely bind the session's context manager to our class lifecycle
-            session_cm = self._mcp_client.session("stealth-browser")
-            self._mcp_session = await self._exit_stack.enter_async_context(session_cm)
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to start MCP session: {e}")
-            await self.disconnect()
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_SESSION_START"]
-        # Step 3: Load Tools
-        try:
-            # Assuming load_mcp_tools is imported globally in your file
-            self._tools = await load_mcp_tools(self._mcp_session)
-            self._tools_summary = "\n".join([f"* Tool: {t.name}\nDescription: {t.description}" for t in self._tools]) + "\n"
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to load tools: {e}")
-            await self.disconnect()
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_LOAD_TOOLS"]
-        return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_OK"]
-
-    async def restart(self) -> int:
-        """
-        Restart the MCP connection by disconnecting and reconnecting.
-        This useful for recovering from errors or when wanting to refresh
-        the browser instance. It performs a complete teardown and rebuild
-        of the MCP connection stack.
-        Returns:
-            int: Error code from connect() method.
-        """
-        await self.disconnect()
-        return await self.connect()
-
-    async def create_managed_browser(self, headless=False) -> int:
-        """
-        Spawn a new managed browser instance through the MCP server.
-        Creates a new stealth browser instance that can be controlled via
-        MCP tools. The browser runs in a headless environment but can be
-        configured for visualization during debugging.
-        Args:
-            headless (bool, default=False): If True, browser runs without GUI.
-                Set to False for debugging/visualization, True for production.
-        Returns:
-            int: Error code from ERROR_MCP_CODES_NUMS:
-                - ERROR_MCP_OK (0): Browser spawned successfully
-                - ERROR_MCP_SESSION_STOP (2): No active session
-                - ERROR_MCP_BROWSER_STOP (8): Browser already exists
-                - ERROR_MCP_BROWSER_SPAWN (9): Failed to spawn browser
-        """
-        if self._mcp_session is None:
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_SESSION_STOP"]
-        if self.managed_browser is not None:
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_BROWSER_STOP"]
-        try:
-            result = await self._mcp_session.call_tool("spawn_browser", {"headless": headless})
-            data = json.loads(result.content[0].text if result.content and len(result.content) > 0 else str(result))
-            self._managed_browser = BrowserProxy(logger=self.logger, _mcp_session=self._mcp_session, browser_instance_id=data.get("instance_id"))
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to launch a managed browser: {e}")
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_BROWSER_SPAWN"]
-        return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_OK"]
-
-    async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> int:
-        """
-        Generic wrapper for calling MCP tools through the session.
-        Provides a simplified interface for invoking MCP tools with proper
-        error handling and session validation.
-        Args:
-            tool_name (str): Name of the MCP tool to invoke (e.g., "click", "type", "navigate").
-            arguments (Dict[str, Any]): Arguments to pass to the tool. Structure depends on
-                the specific tool being called.
-        Returns:
-            int: Error code from ERROR_MCP_CODES_NUMS:
-                - ERROR_MCP_OK (0): Tool call successful
-                - ERROR_MCP_SESSION_START (4): No active session
-                - ERROR_MCP_TOOL_CALL (10): Failed to execute tool
-        """
-        if self._managed_browser is None:
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_BROWSER_NOT_EXISTS"]
-        try:
-            # Assumes BrowserProxy is implemented dynamically with __call__ 
-            result = await self._managed_browser(tool_name, arguments=arguments)
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to call {tool_name} mcp tool. Error: {e}")
-            return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_TOOL_CALL"]
-        return self.ERROR_MCP_CODES_NUMS["ERROR_MCP_OK"]
-    
 
 #   --------   A G E N T I C   P A R T   -------- 
-
-# This routine extract amount of tokens 'locked' in tools
-async def get_tools_tokens_length(tools_str: str) -> int :
-    headers = {"Authorization": f"Bearer {BASE_API_KEY}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=60.0) as client :
-        response = await client.post( "/tokenize", json={ "model": MODEL_NAME, "prompt": tools_str, } )
-        response.raise_for_status()
-    return response.json().get("count", len(response.json().get("tokens", [])))
-# This routine truncates the prompt to fit into a model
-async def truncate_prompt(prompt: str, max_tokens_number: int) -> str :
-    headers={ "Authorization": f"Bearer {BASE_API_KEY}", "Content-Type": "application/json" }
-    async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=30.0) as client:
-        response = await client.post("/tokenize", json={ "model": MODEL_NAME, "prompt": prompt, })
-        response.raise_for_status()
-        tokens = response.json().get("tokens", [])
-        if response.json().get("count", len(tokens)) > max_tokens_number :
-            response = await client.post("/detokenize", json={"model": MODEL_NAME, "tokens": tokens[: max_tokens_number]})
-            response.raise_for_status()
-            return response.json().get("text", "")
-        else :
-            return prompt      
 
 
 class AgenticState(TypedDict):
@@ -500,11 +83,6 @@ class AgenticState(TypedDict):
         mcp_manager (StealthMCPManager): Handler for MCP/MCP tools integration.
         rabbit_manager (RabbitMQClient): Handler for message queue operations.
         redis_manager (RedisDBClient): Handler for visited URL tracking.
-        site_filter (SiteFilter): Site-specific apriori traversal filter
-            (booster) selected from the entry URL; the no-op default for
-            unregistered sites. Rejects non-story branches before the browser
-            enters them. The zero-level (entry) URL itself is exempt from the
-            filter: only URLs popped from the recursion lists are checked.
     """
     date_str         : str
     urls             : List[List[str]]
@@ -519,7 +97,6 @@ class AgenticState(TypedDict):
     mcp_manager      : StealthMCPManager  
     rabbit_manager   : RabbitMQClient     
     redis_manager    : RedisDBClient
-    site_filter      : SiteFilter
 
 
 # The agentic system
@@ -556,14 +133,6 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
     Raises:
         AssertionError: If state becomes desynchronized or browser management fails.
     """
-
-    # Select the site-specific booster (apriori filter) based on the name of
-    # the entry URL. Registered sites get a concrete filter that rejects
-    # non-story branches (e.g. Yahoo Finance /quote/<TICKER> aggregators)
-    # BEFORE the browser enters them, which speeds up the traversal.
-    # Unregistered sites get the no-op default filter.
-    site_filter = select_site_filter(url_string)
-    logger.info(f"SITE FILTER SELECTED. Entry URL={url_string} -> {type(site_filter).__name__}")
 
     # ----------------------------   A G E N T S   ----------------------------
 
@@ -606,6 +175,10 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
             None (modifies state in-place)
         """
         
+        # Script-controlled page access: the managed browser must exist for every
+        # path below (navigate, get_content, the LLM tool loop and the prompt).
+        assert state["mcp_manager"].managed_browser is not None , "Managed browser is not available!"
+
         # --- Handle URL stack and check if URL is already visited ---
         if not state["page_history"] :    # New page - need to get URL from stack
             state["retry_counter"][0] = 0 # Reset retry counter for the new page
@@ -620,22 +193,21 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                 # is NOT updated here - it is updated only after classification
                 # in page_classify_agent. Returns 1 if already visited.
                 if len(state["urls"]) == 1 or await state["redis_manager"].check_only(url) != 1 :
-                    # Apriori site-specific pruning: reject known non-story branches
-                    # (e.g. Yahoo Finance /quote/<TICKER> aggregators) BEFORE entering.
-                    # Only URLs popped from the recursion lists (level > 0) are
-                    # filtered; the zero-level (entry) URL is always visited as-is.
-                    if len(state["urls"]) != 1 and not state["site_filter"].is_story_candidate(url) :
-                        logger.info(f"SKIPPED URL (apriori site filter). url={url}")
-                    else                                                :
-                        state["url_current"][0] = url
-                        logger.info(f"NEW URL. Navigating to: {url}")
-                        await state["mcp_manager"].managed_browser.navigate(state["url_current"][0])
-                        break
+                    state["url_current"][0] = url
+                    logger.info(f"NEW URL. Navigating to: {url}")
+                    nav_res = await state["mcp_manager"].managed_browser.navigate(state["url_current"][0])
+                    if nav_res is None :
+                        # A failed navigation would make get_content() return the
+                        # PREVIOUS page's content: never trust it - skip to the next URL.
+                        logger.warning(f"NAVIGATE FAILED, skipping URL: {url}")
+                        continue
+                    break
                 else              :
                     logger.info(f"SKIPPED URL. Already visited: {url}")
         
         # Fetch current browser state via BrowserProxy.get_content()
-        state["browser_state"][0] = await state["mcp_manager"].managed_browser.get_content()
+        # (None on a transport-level failure - normalize to "" so len()/clean_dom() below are safe)
+        state["browser_state"][0] = await state["mcp_manager"].managed_browser.get_content() or ""
         state["browser_state"][0] = clean_dom(state["browser_state"][0]) if len(state["browser_state"][0]) else ""
         if not len(state["browser_state"][0]) or state["retry_counter"][0] == state["retries_max"] :
             state["page_history"].clear()
@@ -719,7 +291,7 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                     if tname != "get_page_content" : 
                         targs = tc.value.get('arguments', {}) if hasattr(tc, 'value') else tc.get('arguments', {})
                         result = await state["mcp_manager"].managed_browser(tname, targs)
-                        txt = result.content[0].text[:200] if result and hasattr(result, 'content') else ""
+                        txt = result.content[0].text[:200] if result and getattr(result, "content", None) else ""
                         tool_calls_log.append(f"CALLED TOOL: {tname} -> {txt}\n")
                 if len(tool_calls_log) : # Update the history with tools results
                     state["page_history"].append(f"{response.content.lstrip('\n').rstrip('\n')}\n{''.join(tool_calls_log)}\n")
@@ -755,12 +327,12 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
         """
 
         # Use managed_browser proxy for cleaner and more robust browser interactions
-        # The proxy automatically handles instance_id and connection health checks
+        # (instance_id is injected by the proxy's direct session calls; transport
+        # errors are handled inside get_links() itself and surfaced as None)
         if len(state["browser_state"][0]) :
             # Ensure managed_browser is available before proceeding
             assert state["mcp_manager"].managed_browser is not None , "Managed browser is not available!"
             # Extract links from the page using the managed_browser proxy's get_links() method
-            # This is cleaner than direct session.call_tool() and uses the existing BrowserProxy functionality
             # get_links() returns Optional[Set[str]] directly, not an MCP result object
             links_result = await state["mcp_manager"].managed_browser.get_links()
             extracted_links = list(links_result) if links_result else []
@@ -874,11 +446,7 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                         logger.debug(f"AGGREGATOR page. URL NOT marked as visited in Redis (eligible for revisit): {state['url_current'][0]}")
                     # Extract links if we have some hops
                     if  len(state["urls"]) < state["deepness_max"] and extracted_links :
-                        # Apriori site-specific pruning: drop known non-story branches
-                        # so they never enter the traversal stack.
-                        links_to_push = state["site_filter"].filter_urls(extracted_links)
-                        if links_to_push :
-                            state["urls"].append(links_to_push)
+                        state["urls"].append(extracted_links)
             state["browser_state"][0] = ""
         return None
 
@@ -922,7 +490,6 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
                            "mcp_manager"      : mcp_manager,
                            "rabbit_manager"   : rabbit_manager,
                            "redis_manager"    : redis_manager,
-                           "site_filter"      : site_filter,
                         })
     
     # External driver loop: reuses the compiled 'graph' across all URL iterations
@@ -939,7 +506,7 @@ async def run_agentic_crawler(url_string : str, mcp_manager : StealthMCPManager,
 
 
 async def run_stealth_graph(url_string : str = "https://ca.finance.yahoo.com/", deepness_max : int = 2, pages_max :int = -1, retries_max : int = 3,
-                            html_folder_name : str = "./html/", rabbit_host : str = "localhost", rabbit_port : int = 15672, redis_host : str = "localhost", redis_port : int = 6379) :
+                            html_folder_name : str = "./html/", rabbit_host : str = "localhost", rabbit_port : int = 5672, redis_host : str = "localhost", redis_port : int = 6379) :
     """
     Main orchestration function that initializes all components and runs the crawler.
     
@@ -953,7 +520,7 @@ async def run_stealth_graph(url_string : str = "https://ca.finance.yahoo.com/", 
         pages_max (int, default=-1): Maximum pages to visit (-1 = unlimited).
         retries_max (int, default=3): Maximum retry attempts for failed page access.
         rabbit_host (str, default="localhost"): RabbitMQ server hostname.
-        rabbit_port (int, default=15672): RabbitMQ management port.
+        rabbit_port (int, default=5672): RabbitMQ AMQP port.
         redis_host (str, default="localhost"): Redis server hostname.
         redis_port (int, default=6379): Redis server port.
         

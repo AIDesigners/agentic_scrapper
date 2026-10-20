@@ -20,8 +20,16 @@ head of the queue (reject with requeue), so the queue is never drained. If
 a worker crashes before settling the message, the broker requeues it for
 another worker instead of losing it. Many workers of the same consumer group
 may run in parallel: a busy worker holds its single in-flight message while
-idle workers pick up the next ones, and the long heartbeat keeps the
-connection alive across slow multi-LLM-call processing.
+idle workers pick up the next ones, and the long AMQP heartbeat keeps the
+connection alive across slow multi-LLM-call processing (the client keeps
+heartbeating while its event loop runs, so the broker only times out a
+truly frozen worker, whose in-flight message is requeued and the channel is
+re-opened on the next pull). In addition,
+publish_and_ack_json() settles the in-flight message in the SAME AMQP
+transaction as the publish of the result: the commit makes the output
+message visible and consumes the input atomically, and a failure/crash
+before the commit rolls both back (the input is requeued), so the result is
+never published twice for a single input message.
 
 Usage:
     # Production (default)
@@ -40,6 +48,7 @@ import json
 from typing import Optional, List, Tuple, Dict, Any
 from collections import deque
 import aio_pika
+from aio_pika.transaction import Transaction
 #from aio_pika.exceptions import QueueEmpty, ChannelNotFoundEntity, AMQPChannelError
 
 logger = logging.getLogger(__name__)
@@ -65,13 +74,20 @@ class RabbitMQClient:
     readonly mode BOTH settle calls are non-destructive - the message is
     put back onto the head of the queue (the queue is never drained, so
     runs can be repeated) - and writes go to an internal buffer so the
-    server remains unchanged.
+    server remains unchanged. publish_and_ack_json() goes one step
+    further: it publishes the result and acknowledges the in-flight input
+    message inside a single AMQP transaction, so the two effects commit
+    atomically (a pre-commit failure/crash rolls both back and the input
+    is requeued - no duplicate publish for one input message).
     Attributes:
         PREFETCH_COUNT: basic.qos limit - exactly one unacknowledged
                         message per worker (channel) at a time.
-        HEARTBEAT_TIMEOUT: Connection heartbeat timeout (seconds); long
-                        enough to survive multi-LLM-call processing of a
-                        single message without AMQP traffic.
+        HEARTBEAT_TIMEOUT: Default AMQP heartbeat (seconds) of the broker
+                        connection (the broker only closes it after 2x this
+                        value of total frame silence; the client keeps
+                        heartbeating during long LLM waits). Overridable per
+                        client with the `heartbeat` constructor parameter.
+        _heartbeat: The resolved heartbeat value used by connect().
         _connected: Whether the client is connected.
         _pending_message: The in-flight message pulled with receive_json(),
                           None when no message is in flight.
@@ -92,11 +108,17 @@ class RabbitMQClient:
     # so the broker hands the next message to another idle worker of the
     # same consumer group.
     PREFETCH_COUNT = 1
-    # Heartbeat timeout (seconds) of the broker connection. Processing one
-    # message involves several LLM calls and can take minutes without any
-    # AMQP traffic on the connection, so the heartbeat must outlast a full
-    # processing cycle; the acknowledgment itself is still manual (see
-    # ack_pending()) and happens as soon as the processing completes.
+    # AMQP heartbeat (seconds) of the broker connection. The broker closes
+    # the connection only after 2x this value of TOTAL frame silence; the
+    # client keeps sending heartbeat frames every value/2 as long as its
+    # event loop runs - including while long LLM calls are awaited (the
+    # heartbeat task is a background asyncio task) - so a live worker
+    # survives arbitrarily slow processing no matter how long a single
+    # message takes. The window matters only when the worker is truly frozen
+    # (wedged process, network partition): then the broker requeues the
+    # in-flight message and the channel is re-opened on the next pull (see
+    # receive_json()). The value is tunable per client (constructor
+    # `heartbeat` parameter / RABBIT_HEARTBEAT environment variable).
     HEARTBEAT_TIMEOUT = 300
     def __init__(
         self,
@@ -107,7 +129,8 @@ class RabbitMQClient:
         receive_queue_name: Optional[str] = None,
         username: str = "guest",
         password: str = "guest",
-        readonly: Optional[bool] = None
+        readonly: Optional[bool] = None,
+        heartbeat: Optional[int] = None
     ) -> None:
         """
         Initialize the RabbitMQ client.
@@ -123,12 +146,21 @@ class RabbitMQClient:
                       non-destructive reads, buffered writes). If False, uses
                       full real RabbitMQ semantics. If None, checks the DEBUG
                       environment variable.
+            heartbeat: AMQP heartbeat (seconds) of the broker connection.
+                       The broker closes the connection only after 2x this
+                       value of total frame silence, and the client keeps
+                       sending heartbeats during long LLM waits, so a live
+                       worker is never timed out mid-processing; the window
+                       applies only to a truly frozen worker (its in-flight
+                       message is requeued and the channel is re-opened on
+                       the next pull). None -> HEARTBEAT_TIMEOUT (300).
         """
         # Determine if we should use readonly mode
         if readonly is None:
             import os
             readonly = os.environ.get('DEBUG', '').lower() in ('true', '1', 'yes')
         self.readonly = readonly
+        self._heartbeat = self.HEARTBEAT_TIMEOUT if heartbeat is None else heartbeat
         self._host = host
         self._port = port
         self._vhost = vhost
@@ -189,10 +221,13 @@ class RabbitMQClient:
         In readonly mode the same real connection is used, but reads become
         non-destructive (the in-flight message is put back onto the head of
         the queue when settled) and writes are buffered.
-        The connection is opened with a long heartbeat (HEARTBEAT_TIMEOUT):
-        processing a single message involves several LLM calls and can take
-        minutes without any AMQP traffic, so the heartbeat must not kill the
-        connection during normal slow processing. The channel is limited to
+        The connection is opened with the configured heartbeat (self._heartbeat,
+        default HEARTBEAT_TIMEOUT): the broker closes it only after 2x that
+        value of total frame silence, and the client keeps heartbeating while
+        its event loop runs - including during long LLM calls - so normal slow
+        processing never kills the connection; the window applies only to a
+        truly frozen worker (its in-flight message is requeued by the broker
+        and the channel is re-opened on the next pull). The channel is limited to
         exactly PREFETCH_COUNT unacknowledged message(s), and messages are
         acknowledged only after their processing completes (see
         receive_json(), ack_pending() and requeue_pending()), so a worker
@@ -207,23 +242,39 @@ class RabbitMQClient:
             0 on success, -1 on failure (or the client is already connected
             with a live channel).
         """
+        if self._channel is not None and not self._channel.is_closed:
+            logger.error("RabbitMQ ERROR. Client is already opened!")
+            return -1
+        # The channel is missing/closed: prefer re-opening it on the existing
+        # (robust) connection and re-applying the prefetch limit; if that
+        # fails (e.g. the connection itself is gone or is in the middle of a
+        # reconnection), drop the old connection and fall back to a fresh
+        # connect_robust below.
         if self._connection is not None:
-            if self._channel is not None and not self._channel.is_closed:
-                logger.error("RabbitMQ ERROR. Client is already opened!")
-                return -1
-            # The connection is alive but the channel was closed by the
-            # broker or a network failure: re-open it on the existing
-            # connection and re-apply the prefetch limit
             try :
-                self._channel = await self._connection.channel()
+                # publisher_confirms=False: the channel must stay switchable
+                # to AMQP transaction (tx) mode for the atomic
+                # publish_and_ack_json() settle - a channel opened in
+                # confirm mode cannot be switched to tx mode (and the
+                # transaction's commit-ok already guarantees the buffered
+                # publishes reached the broker).
+                self._channel = await self._connection.channel(publisher_confirms=False)
                 await self._channel.set_qos(prefetch_count=self.PREFETCH_COUNT)
             except Exception as e:
-                logger.error(f"RabbitMQ ERROR. Failed to re-open the channel, error: {e}")
-                return -1
-            self._connected = True
-            logger.info(f"RabbitMQ channel re-opened on the existing connection to {self._host}:{self._port} "
-                        f"(prefetch={self.PREFETCH_COUNT})")
-            return 0
+                logger.warning(f"RabbitMQ: could not re-open the channel on the existing connection ({e}); "
+                               "falling back to a fresh connection")
+                try :
+                    if not self._connection.is_closed :
+                        await self._connection.close()
+                except Exception :
+                    pass
+                self._connection = None
+                self._channel = None
+            else :
+                self._connected = True
+                logger.info(f"RabbitMQ channel re-opened on the existing connection to {self._host}:{self._port} "
+                            f"(prefetch={self.PREFETCH_COUNT})")
+                return 0
         try:
             # connect_robust automatically handles reconnects
             self._connection = await aio_pika.connect_robust(
@@ -232,7 +283,7 @@ class RabbitMQClient:
                 virtualhost=self._vhost,
                 login=self._username,
                 password=self._password,
-                heartbeat=self.HEARTBEAT_TIMEOUT,
+                heartbeat=self._heartbeat,
             )
             # Open the worker channel and limit it to exactly
             # PREFETCH_COUNT unacknowledged messages (basic.qos). With many
@@ -240,14 +291,20 @@ class RabbitMQClient:
             # worker holds at most one message in flight; the next message
             # is delivered only to a worker whose previous message has
             # already been acknowledged or rejected.
-            self._channel = await self._connection.channel()
+            # publisher_confirms=False: the channel must stay switchable to
+            # AMQP transaction (tx) mode for the atomic
+            # publish_and_ack_json() settle - a channel opened in confirm
+            # mode cannot be switched to tx mode (and the transaction's
+            # commit-ok already guarantees the buffered publishes reached
+            # the broker).
+            self._channel = await self._connection.channel(publisher_confirms=False)
             await self._channel.set_qos(prefetch_count=self.PREFETCH_COUNT)
             self._connected = True
             if self.readonly:
                 logger.info(f"RabbitMQ connected to {self._host}:{self._port} (readonly: non-destructive reads, buffered writes)")
             else:
                 logger.info(f"RabbitMQ connected to {self._host}:{self._port} "
-                            f"(manual ack, prefetch={self.PREFETCH_COUNT}, heartbeat={self.HEARTBEAT_TIMEOUT}s)")
+                            f"(manual ack, prefetch={self.PREFETCH_COUNT}, heartbeat={self._heartbeat}s)")
             return 0
         except Exception as e:
             logger.error(f"RabbitMQ ERROR. Failed to connect, error: {e}")
@@ -453,11 +510,92 @@ class RabbitMQClient:
                 await self.connect()
             return 0
 
+    async def publish_and_ack_json(self, data: dict, queue_name: Optional[str] = None) -> int:
+        """
+        Atomically publish a JSON message and acknowledge the in-flight
+        input message (pulled with receive_json()) in a single AMQP
+        transaction (tx.select / tx.commit): the publish to the output
+        queue and the basic.ack of the input message are buffered at the
+        broker and applied as ONE atomic step on commit.
+        Consequences:
+        - commit -> the output message becomes visible AND the input
+          message is consumed atomically: there is no window in which the
+          result has been published but the input is not yet settled, so a
+          worker crash can never produce a duplicate publish for the same
+          input message;
+        - any failure (or a worker crash) before commit -> the transaction
+          is rolled back: the publish is discarded AND the input message
+          stays unacknowledged, so the broker requeues it for reprocessing
+          - the work is redone and published exactly once on success.
+        In readonly mode there is no real queue to modify: this falls back
+        to the existing non-atomic pair - buffered (non-published) write +
+        non-destructive settle of the head message.
+        Args:
+            data: The JSON data to publish.
+            queue_name: Output queue name (defaults to the publish queue
+                        set at construction).
+        Returns:
+            1 on success (committed, or buffered in readonly mode), 0 on
+            failure. On a failure with a live channel the in-flight message
+            is kept unacknowledged (settle it with requeue_pending()); on a
+            failure with a dead channel the broker has already requeued the
+            in-flight message, the local in-flight state is cleared and the
+            channel is re-opened.
+        """
+        if self._pending_message is None:
+            logger.error("RabbitMQ ERROR. No message in flight to settle - nothing to publish+ack!")
+            return 0
+        if self.readonly:
+            # Buffered write + non-destructive settle (the existing pair)
+            status = await self._publish_json_buffered(data, queue_name)
+            if status == 1:
+                await self.ack_pending()
+                return 1
+            # Nothing was published: the in-flight message is left untouched
+            return 0
+        message = self._pending_message
+        try:
+            async with Transaction(self._channel):  # tx.select on entry
+                if queue_name is None:
+                    queue_name = self._publish_queue_name
+                assert queue_name is not None, "RabbitMQ ERROR. Publishing into unspecified queue!"
+                await self._channel.default_exchange.publish(
+                    aio_pika.Message(body=json.dumps(data).encode("utf-8"),
+                                     delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                                     content_type="application/json"),
+                    routing_key=queue_name)
+                await message.ack()
+            # Clean exit of the context manager -> tx.commit: the publish is
+            # visible and the input message is consumed, atomically
+            self._pending_message = None
+            return 1
+        except Exception as e:
+            # The context manager rolled the transaction back (the rollback
+            # itself may fail on an already-closed channel - that is caught
+            # here too): the publish is discarded and the input message is
+            # still unacknowledged at the broker.
+            logger.error(f"RabbitMQ ERROR. Atomic publish+ack failed (transaction rolled back): {e}")
+            if self._channel is None or self._channel.is_closed:
+                # The channel died: the broker requeues the unacknowledged
+                # in-flight message for another worker; clear the local
+                # in-flight state and re-open the channel for the next pull.
+                self._pending_message = None
+                await self.connect()
+            return 0
+
     async def _receive_json_real(self, queue_name: Optional[str] = None) -> Tuple[int, Optional[dict]]:
         """Real RabbitMQ implementation of receive_json (enforced manual acknowledgment)."""
         if self._channel is None or self._channel.is_closed :
-            logger.error("RabbitMQ error. Client is not connected!")
-            return (-1, None)
+            if self._pending_message is not None :
+                # The channel that held the in-flight message died (broker
+                # heartbeat timeout / network blip): the broker has requeued
+                # that message, so clear the local in-flight state (the
+                # message now belongs to whoever re-pulls it) and re-open the
+                # channel instead of ending the run.
+                self._pending_message = None
+            if await self.connect() != 0 :
+                logger.error("RabbitMQ error. Client is not connected!")
+                return (-1, None)
         if self._pending_message is not None :
             # One message in flight at a time (prefetch=1): the previous one
             # must be settled with ack_pending()/requeue_pending() first.
@@ -508,8 +646,16 @@ class RabbitMQClient:
         and runs can be repeated.
         """
         if self._channel is None or self._channel.is_closed:
-            logger.error("RabbitMQ error. Client is not connected!")
-            return (-1, None)
+            if self._pending_message is not None :
+                # The channel that held the in-flight message died (broker
+                # heartbeat timeout / network blip): the broker has requeued
+                # that message, so clear the local in-flight state (the
+                # message now belongs to whoever re-pulls it) and re-open the
+                # channel instead of ending the run.
+                self._pending_message = None
+            if await self.connect() != 0 :
+                logger.error("RabbitMQ error. Client is not connected!")
+                return (-1, None)
         if self._pending_message is not None :
             # One message in flight at a time (prefetch=1): the previous one
             # must be settled with ack_pending()/requeue_pending() first.
