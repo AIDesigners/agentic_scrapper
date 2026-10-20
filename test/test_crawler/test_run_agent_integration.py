@@ -49,16 +49,24 @@ def _archives() -> list[str]:
 @pytest.mark.asyncio
 @pytest.mark.integration
 async def test_debug_agent_crawl_two_stories():
+    prev_debug = os.environ.get('DEBUG')
     os.environ['DEBUG'] = '1'
     _clean_today()
-
-    error = await run_stealth_graph(
-        url_string=_SEED,
-        deepness_max=2,
-        retries_max=1,
-        pages_max=2,
-        html_folder_name=_HTML_DIR,
-    )
+    try:
+        error = await run_stealth_graph(
+            url_string=_SEED,
+            deepness_max=2,
+            retries_max=1,
+            pages_max=2,
+            html_folder_name=_HTML_DIR,
+        )
+    finally:
+        # Restore the environment: a leaked DEBUG would silently switch
+        # later RedisDBClient(readonly=False) tests into readonly mode.
+        if prev_debug is None:
+            os.environ.pop('DEBUG', None)
+        else:
+            os.environ['DEBUG'] = prev_debug
 
     assert error == 0, f"run_stealth_graph returned code {error}"
 

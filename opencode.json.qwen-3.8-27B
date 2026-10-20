@@ -12,8 +12,8 @@
         "unsloth/Qwen3.8-27B-NVFP4": {
           "name": "Qwen-3.8-27B-NVFP4",
           "limit": {
-            "context": 163840,
-            "output": 163840
+            "context": 188416,
+            "output": 188416
           }
         }
       }
