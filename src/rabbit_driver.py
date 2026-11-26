@@ -45,7 +45,7 @@ Usage:
 
 import logging
 import json
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, AsyncIterator
 from collections import deque
 import aio_pika
 from aio_pika.transaction import Transaction
@@ -509,6 +509,61 @@ class RabbitMQClient:
             if self._channel is not None and self._channel.is_closed:
                 await self.connect()
             return 0
+
+    async def iter_queue_json(self, queue_name: Optional[str] = None, max_messages: int = -1) -> AsyncIterator[dict]:
+        """
+        Receive JSON messages from the queue as an async iterator, one at a
+        time.
+        Every read uses the same ENFORCED deferred (manual) acknowledgment as
+        receive_json(): each message is pulled WITHOUT being acknowledged and
+        stays unacknowledged at the broker (held by this worker under the
+        prefetch=1 limit) until the caller settles it with ack_pending() or
+        requeue_pending() once the processing of its payload is done. If a
+        worker crashes before settling the message, the broker requeues it
+        for another worker instead of losing it.
+        The iterator stops (returns) when:
+        - the queue is exhausted (or the connection is down),
+        - max_messages >= 0 and max_messages messages have been yielded -
+          checked BEFORE the next pull, so a clean stop never pulls an extra
+          message and leaves nothing in flight (max_messages=-1 = unlimited),
+          or
+        - (readonly) the queue cycled back to an already-seen message: the
+          readonly run re-reads the (requeued) head message on every
+          iteration, so the head's file_path is remembered per run and, as
+          soon as it is observed twice, the in-flight head message is
+          settled first (a non-destructive requeue in readonly mode) and the
+          iterator stops instead of looping forever on the same file.
+        Args:
+            queue_name: The queue name to receive from.
+            max_messages: The maximal number of messages to yield (-1 for
+              no limit).
+        Yields:
+            One JSON message per iteration (it is now in flight and must be
+            settled with ack_pending()/requeue_pending()).
+        """
+        seen_file_paths: set = set()
+        messages_yielded = 0
+        while True:
+            (status, message) = await self.receive_json(queue_name=queue_name)
+            if status != 1 or message is None:
+                return  # the queue is exhausted (or not connected)
+            if self.readonly:
+                # The readonly run always re-reads the (requeued) head
+                # message: if we have seen this file in this run already,
+                # the queue cycled back to it - stop instead of looping
+                # forever on the same file. Settle the just-pulled head
+                # message first (non-destructive requeue in readonly mode)
+                # so nothing is left in flight (unacknowledged) when the
+                # run stops.
+                file_path_key = message.get("file_path")
+                if file_path_key in seen_file_paths:
+                    await self.ack_pending()
+                    return
+                seen_file_paths.add(file_path_key)
+            yield message
+            messages_yielded += 1
+            if max_messages >= 0 and messages_yielded >= max_messages:
+                return  # the message budget is spent - no next pull, nothing left in flight
 
     async def publish_and_ack_json(self, data: dict, queue_name: Optional[str] = None) -> int:
         """

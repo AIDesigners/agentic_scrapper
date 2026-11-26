@@ -33,6 +33,9 @@ import statistics
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from langchain_openai import ChatOpenAI
 from harness_framework import build_graph
+from llm_config import BASE_URL, BASE_API_KEY, MODEL_NAME, LLM_BASE_CONTEXT_LEN, LLM_MAX_OUTPUT_TOKENS, \
+                       SERVITOR_BASE_URL, SERVITOR_API_KEY, SERVITOR_MODEL_NAME, \
+                       LLM_READ_TIMEOUT_S, LLM_PING_TIMEOUT_S, PERPLEXITY_TIMEOUT_S
 
 
 # =====================================================================
@@ -87,36 +90,6 @@ from harness_framework import build_graph
 #
 # =====================================================================
 
-BASE_URL="http://ifo4:8000"
-BASE_API_KEY="alex_llm_qwen"
-MODEL_NAME="unsloth/Qwen3.8-27B-NVFP4"
-LLM_BASE_CONTEXT_LEN = 163840 # 131072 # 196608
-LLM_MAX_OUTPUT_TOKENS = 32768
-# --- The perplexity servitor (a llama.cpp wrapper running a small model on
-# a dedicated host): the post-accept perplexity of a story is measured
-# against this model, not against the big base LLM.
-SERVITOR_BASE_URL = "http://ifo4:8002"
-SERVITOR_API_KEY = "alex_llm_qwen"
-SERVITOR_MODEL_NAME = "qwen35-4b"
-# --- LLM / broker liveness tuning (env-overridable) ---
-# Busy vLLM (max-num-seqs 1) queues a request behind the in-flight
-# generation, so a single call can legitimately take a long time in a slow
-# environment: the read timeout of the LLM client is capped at 2h by default
-# (LLM_READ_TIMEOUT, seconds) - long enough for busy servers, short enough
-# to bound a wedged one - and the SDK-level retries are disabled
-# (max_retries=0) so the harness attempt budget is the single retry
-# authority. A truly dead vLLM peer is surfaced by the default TCP keepalive
-# (langchain-openai) in about 2 minutes, independent of the read timeout.
-LLM_READ_TIMEOUT_S = float(os.environ.get("LLM_READ_TIMEOUT", "7200"))
-# The startup health gate sends a trivial "ping" generation, which on a busy
-# server queues behind the in-flight generation: give it 600s by default
-# (LLM_PING_TIMEOUT, seconds) instead of failing a healthy-but-busy server.
-LLM_PING_TIMEOUT_S = float(os.environ.get("LLM_PING_TIMEOUT", "600"))
-# The post-accept perplexity measurement (monitoring only) is a single
-# prompt-scoring pass over the whole story on the servitor's dedicated
-# host: 300s bounds a wedged servitor without queueing behind long
-# extraction generations on the base LLM.
-PERPLEXITY_TIMEOUT_S = 300.0
 # Zero-width characters (BOM, ZWSP, ZWJ, ZWNJ, word joiner): the servitor
 # rebuilds each token's "bytes" from DETOKENIZED text, and detokenization
 # drops those characters - silently missing bytes in the response.
@@ -1067,38 +1040,14 @@ async def run_agentic_scraper(llm_base : ChatOpenAI, llm_servitor : httpx.AsyncC
     # compressed to news/<crawl date>/, and publishes the story metadata
     # (path + title + perplexity - no story text) to the processed-stories
     # queue AND acknowledges the input message atomically in one AMQP
-    # transaction (or logs progress in readonly/debug mode). The loop stops
-    # when the saved-pages counter reaches the limit, the queue is
-    # exhausted, or (readonly) the queue cycles back to an already-seen file.
-    async def iter_queue_messages() :
-        seen_file_paths : set = set()
-        while True :
-            if ( pages_max >= 0 and pages_saved >= pages_max ) : break  # break on pages limit
-            # Pull the next message WITHOUT acknowledging it (enforced manual
-            # ack - there is no automatic-ack option): it stays unacknowledged
-            # until its processing is done (the settle at the end of the
-            # loop), so a worker crash requeues it instead of losing it. In
-            # readonly mode the settle is a non-destructive requeue of the
-            # head message.
-            (status, message) = await rabbit_manager.receive_json(queue_name=CRAWLER_JSON_QUEUE)
-            if status != 1 or message is None : break  # the queue is exhausted (or not connected)
-            if rabbit_manager.readonly :
-                # The readonly run always re-reads the (requeued) head
-                # message: if we have seen this file in this run already,
-                # the queue cycled back to it - stop instead of looping
-                # forever on the same file. Settle the just-pulled head
-                # message first (non-destructive requeue in readonly mode)
-                # so nothing is left in flight (unacknowledged) when the
-                # run stops.
-                file_path_key = message.get("file_path")
-                if file_path_key in seen_file_paths :
-                    await rabbit_manager.ack_pending()
-                    break
-                seen_file_paths.add(file_path_key)
-            yield message
-
+    # transaction (or logs progress in readonly/debug mode). The loop (the
+    # driver's iter_queue_json) stops when the queue is exhausted, the
+    # pages_max message budget is spent (checked before the next pull, so
+    # nothing is left in flight at the stop), or (readonly) the queue cycles
+    # back to an already-seen file.
     html_file_name = ""
-    async for message in iter_queue_messages() :
+    async for message in rabbit_manager.iter_queue_json(queue_name=CRAWLER_JSON_QUEUE,
+                                                        max_messages=pages_max) :
         source_file_path = message.get("file_path")
         if not source_file_path :
             logger.error(f"Malformed queue message (no file_path): {message}")

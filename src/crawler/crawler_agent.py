@@ -24,6 +24,7 @@ import json
 import datetime
 import uuid
 import gzip
+import httpx
 
 # Make the parent 'src' directory importable so that modules moved there
 # (rabbit_driver, redis_driver) can be imported as top-level modules.
@@ -36,10 +37,31 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 
 from web_tools import clean_dom, BrowserProxy, StealthMCPManager
-from agent_tools import BASE_URL, BASE_API_KEY, MODEL_NAME, get_tools_tokens_length, truncate_prompt
+from llm_config import BASE_URL, BASE_API_KEY, MODEL_NAME, LLM_BASE_CONTEXT_LEN, LLM_MAX_OUTPUT_TOKENS
 
-LLM_BASE_CONTEXT_LEN = 163840 # 131072 # 196608 
-LLM_MAX_OUTPUT_TOKENS = 32768
+
+#  ------------   T O K E N I Z E R   H E L P E R S   ------------ #
+
+# This routine extract amount of tokens 'locked' in tools
+async def get_tools_tokens_length(tools_str: str) -> int :
+    headers = {"Authorization": f"Bearer {BASE_API_KEY}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=60.0) as client :
+        response = await client.post( "/tokenize", json={ "model": MODEL_NAME, "prompt": tools_str, } )
+        response.raise_for_status()
+    return response.json().get("count", len(response.json().get("tokens", [])))
+# This routine truncates the prompt to fit into a model
+async def truncate_prompt(prompt: str, max_tokens_number: int) -> str :
+    headers={ "Authorization": f"Bearer {BASE_API_KEY}", "Content-Type": "application/json" }
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=headers, timeout=30.0) as client:
+        response = await client.post("/tokenize", json={ "model": MODEL_NAME, "prompt": prompt, })
+        response.raise_for_status()
+        tokens = response.json().get("tokens", [])
+        if response.json().get("count", len(tokens)) > max_tokens_number :
+            response = await client.post("/detokenize", json={"model": MODEL_NAME, "tokens": tokens[: max_tokens_number]})
+            response.raise_for_status()
+            return response.json().get("prompt", "")
+        else :
+            return prompt
 
 
 # --- DEBUG FLAG: Use mock implementations for testing/debugging ---

@@ -85,7 +85,7 @@ from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, Remo
 from langgraph.graph import StateGraph, START, END
 
 from web_tools import clean_dom, BrowserProxy, StealthMCPManager
-from agent_tools import BASE_URL, BASE_API_KEY, MODEL_NAME
+from llm_config import BASE_URL, BASE_API_KEY, MODEL_NAME
 
 from rabbit_driver import RabbitMQClient
 from redis_driver import RedisDBClient
@@ -101,7 +101,7 @@ NEWS_PATH_MARK = "/news/"
 FINANCE_HOST_SUFFIX = ".finance.yahoo.com"
 
 # --- LLM (vLLM) settings - shared endpoint constants (BASE_URL / BASE_API_KEY
-# / MODEL_NAME) come from agent_tools; only the context/output budgets are
+# / MODEL_NAME) come from llm_config; only the context/output budgets are
 # yahoo-specific ------------------------------------------------------------
 LLM_BASE_CONTEXT_LEN = 188416
 LLM_MAX_OUTPUT_TOKENS = 32768
@@ -152,7 +152,7 @@ def is_yahoo_news_url(url: str) -> bool:
 async def get_prompt_tokens_length(prompt: str) -> int :
     """
     Count the tokens of a string via the vLLM /tokenize endpoint.
-    The Yahoo-crawler-local copy of the agent_tools token counter: this
+    The Yahoo-crawler-local copy of the crawler_agent token counter: this
     crawler's LLM is tools-free (no bound tools, so the tools token count
     is 0), so this helper counts the classification prompt itself and the
     shared tools-flavored get_tools_tokens_length helper is not used here.
@@ -286,7 +286,7 @@ _FIRST_STORY_REVEAL_JS = r"""
 #   --------   A G E N T I C   P A R T   --------
 
 # The LLM endpoint constants are NOT cloned here: the single canonical copies
-# live in agent_tools.py and are imported above. The prompt token counter
+# live in llm_config.py and are imported above. The prompt token counter
 # (get_prompt_tokens_length) is defined locally: this crawler's LLM has no
 # tools, so the shared tools-flavored helper does not apply.
 
